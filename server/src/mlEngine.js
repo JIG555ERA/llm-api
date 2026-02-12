@@ -275,6 +275,44 @@ function toNumberOrNull(value) {
   return Number.isFinite(n) ? n : null;
 }
 
+function normalizeText(text) {
+  return String(text || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function getBookCategoryNames(book) {
+  if (!Array.isArray(book?.categories)) {
+    return [];
+  }
+  return book.categories
+    .map((category) => String(category?.name || "").trim())
+    .filter(Boolean);
+}
+
+function buildQueryChunks(prompt) {
+  const words = tokenize(prompt);
+  const chunks = [];
+
+  for (let i = 0; i < words.length; i += 1) {
+    chunks.push(words[i]);
+    if (i + 1 < words.length) {
+      chunks.push(`${words[i]} ${words[i + 1]}`);
+    }
+    if (i + 2 < words.length) {
+      chunks.push(`${words[i]} ${words[i + 1]} ${words[i + 2]}`);
+    }
+  }
+
+  return unique(chunks.filter((chunk) => chunk.length >= 3));
+}
+
+function getBookTitle(book) {
+  return String(book?.title || "").trim();
+}
+
 class LLMEngine {
   constructor() {
     this.modelId = MODEL_ID;
@@ -435,6 +473,155 @@ class LLMEngine {
     return JSON.parse(JSON.stringify(author || {}));
   }
 
+  parseQueryConstraints(prompt, books, authors) {
+    const promptText = String(prompt || "");
+    const promptLower = promptText.toLowerCase();
+    const promptNorm = normalizeText(promptText);
+
+    const maxPriceMatch = promptText.match(
+      /\b(?:under|below|less than|upto|up to)\s*(?:rs\.?|inr)?\s*(\d+(?:\.\d+)?)\b/i
+    );
+    const minPriceMatch = promptText.match(
+      /\b(?:above|over|more than|greater than)\s*(?:rs\.?|inr)?\s*(\d+(?:\.\d+)?)\b/i
+    );
+
+    const maxPrice = maxPriceMatch ? toNumberOrNull(maxPriceMatch[1]) : null;
+    const minPrice = minPriceMatch ? toNumberOrNull(minPriceMatch[1]) : null;
+    const hasPriceConstraint = maxPrice !== null || minPrice !== null;
+
+    const allCategories = new Set(
+      books.flatMap((book) => getBookCategoryNames(book).map((name) => name.toLowerCase()))
+    );
+    const explicitCategories = [...allCategories].filter((cat) => promptLower.includes(cat));
+
+    const genreHints = [
+      "fiction",
+      "non fiction",
+      "romance",
+      "mythology",
+      "thriller",
+      "finance",
+      "self help",
+      "business",
+    ].filter((hint) => promptLower.includes(hint));
+
+    const mentionedAuthors = authors
+      .map((author) => String(author?.name || "").trim())
+      .filter((name) => name && promptNorm.includes(normalizeText(name)));
+
+    const queryChunks = buildQueryChunks(promptText);
+
+    return {
+      maxPrice,
+      minPrice,
+      hasPriceConstraint,
+      explicitCategories,
+      genreHints,
+      mentionedAuthors,
+      queryChunks,
+      hasHardFilters:
+        hasPriceConstraint ||
+        explicitCategories.length > 0 ||
+        genreHints.length > 0 ||
+        mentionedAuthors.length > 0,
+    };
+  }
+
+  evaluateBookAgainstConstraints(book, constraints) {
+    const sellingPrice = toNumberOrNull(getBookPrimarySellingPrice(book));
+    const authorNames = getBookAuthorNames(book);
+    const categoryNames = getBookCategoryNames(book).map((name) => name.toLowerCase());
+    const searchBlob = normalizeText(
+      `${book?.title || ""} ${getBookDescription(book)} ${authorNames.join(" ")} ${categoryNames.join(" ")}`
+    );
+
+    const hits = {
+      title: false,
+      author: false,
+      category: false,
+      description: false,
+      price: false,
+      genre: false,
+      chunks: 0,
+    };
+
+    const titleNorm = normalizeText(book?.title || "");
+    const promptNorm = normalizeText(
+      `${constraints.mentionedAuthors.join(" ")} ${constraints.explicitCategories.join(" ")} ${constraints.genreHints.join(" ")}`
+    );
+    if (promptNorm && titleNorm && promptNorm.includes(titleNorm)) {
+      hits.title = true;
+    }
+
+    if (constraints.mentionedAuthors.length) {
+      hits.author = constraints.mentionedAuthors.some((name) =>
+        authorNames.some((bookAuthor) => normalizeText(bookAuthor) === normalizeText(name))
+      );
+    } else if (authorNames.length) {
+      hits.author = true;
+    }
+
+    if (constraints.explicitCategories.length) {
+      hits.category = constraints.explicitCategories.some((cat) =>
+        categoryNames.includes(cat.toLowerCase())
+      );
+    } else if (categoryNames.length) {
+      hits.category = true;
+    }
+
+    hits.description = searchBlob.length > 0;
+
+    if (constraints.hasPriceConstraint) {
+      if (sellingPrice !== null) {
+        const maxOkay = constraints.maxPrice === null || sellingPrice <= constraints.maxPrice;
+        const minOkay = constraints.minPrice === null || sellingPrice >= constraints.minPrice;
+        hits.price = maxOkay && minOkay;
+      } else {
+        hits.price = false;
+      }
+    } else {
+      hits.price = true;
+    }
+
+    if (constraints.genreHints.length) {
+      hits.genre = constraints.genreHints.some((hint) => searchBlob.includes(hint));
+    } else {
+      hits.genre = true;
+    }
+
+    let chunkHits = 0;
+    for (const chunk of constraints.queryChunks) {
+      if (chunk && searchBlob.includes(chunk)) {
+        chunkHits += 1;
+      }
+    }
+    hits.chunks = chunkHits;
+
+    const hardPass =
+      (!constraints.mentionedAuthors.length || hits.author) &&
+      (!constraints.explicitCategories.length || hits.category) &&
+      (!constraints.hasPriceConstraint || hits.price) &&
+      (!constraints.genreHints.length || hits.genre);
+
+    const matchedFieldCount = [
+      hits.title,
+      hits.author,
+      hits.category,
+      hits.description,
+      hits.price,
+      hits.genre,
+    ].filter(Boolean).length;
+    const chunkCoverage = constraints.queryChunks.length
+      ? chunkHits / constraints.queryChunks.length
+      : 0;
+
+    return {
+      hardPass,
+      matchedFieldCount,
+      chunkCoverage,
+    };
+  }
+
   scoreBook(book, promptLower, promptTokensSet, googleHints, intent) {
     const title = String(book?.title || "").toLowerCase();
     const description = String(book?.description || "").toLowerCase();
@@ -577,15 +764,35 @@ class LLMEngine {
     const promptTokensSet = new Set(tokenize(prompt));
     const intent = detectIntent(prompt);
     const googleHints = await this.fetchGoogleHints(prompt);
+    const constraints = this.parseQueryConstraints(prompt, books, this.cache.authors || []);
 
     const scored = books
-      .map((book) => ({
-        score: this.scoreBook(book, promptLower, promptTokensSet, googleHints, intent),
-        book,
-      }))
+      .map((book) => {
+        const baseScore = this.scoreBook(book, promptLower, promptTokensSet, googleHints, intent);
+        const evalResult = this.evaluateBookAgainstConstraints(book, constraints);
+        const fieldBoost = evalResult.matchedFieldCount * 45;
+        const chunkBoost = evalResult.chunkCoverage * 120;
+        const hardFilterPenalty = evalResult.hardPass ? 0 : -300;
+        return {
+          score: baseScore + fieldBoost + chunkBoost + hardFilterPenalty,
+          matchedFieldCount: evalResult.matchedFieldCount,
+          hardPass: evalResult.hardPass,
+          book,
+        };
+      })
       .sort((a, b) => b.score - a.score);
 
-    const strongMatches = scored.filter((item) => item.score > 0).slice(0, limit);
+    const hardPassed = scored.filter((item) => item.hardPass);
+    if (constraints.hasHardFilters && !hardPassed.length) {
+      return [];
+    }
+
+    const pool = hardPassed.length ? hardPassed : scored;
+    const maxFieldCount = pool.length ? Math.max(...pool.map((item) => item.matchedFieldCount)) : 0;
+    const strongMatches = pool
+      .filter((item) => item.score > 0 && item.matchedFieldCount >= Math.max(1, maxFieldCount - 1))
+      .slice(0, limit);
+
     if (strongMatches.length) {
       return strongMatches.map((item) => this.normalizeBook(item.book));
     }
@@ -720,6 +927,9 @@ class LLMEngine {
   buildGeneralBookAnswer(prompt, matchedBooks, matchedAuthors, wikiContext) {
     const cleanPrompt = stripLinks(prompt);
     const topBook = matchedBooks[0];
+    if (!topBook) {
+      return `I checked your catalog for "${cleanPrompt}" but found no exact matches for all requested filters. Try broadening price, category, or author constraints.`;
+    }
 
     const openLine = topBook
       ? `I understood your request about "${cleanPrompt}". The strongest match is "${topBook.title}".`
@@ -810,6 +1020,81 @@ class LLMEngine {
     }. Main languages: ${topLanguages || "not enough language data"}. ${priceLine} ${knownAuthorLine}`;
   }
 
+  isGreetingPrompt(prompt) {
+    const text = normalizeText(prompt);
+    return /\b(hi|hello|hey|good morning|good afternoon|good evening|namaste|yo)\b/i.test(text);
+  }
+
+  isInDomainPrompt(prompt, books, authors) {
+    const text = normalizeText(prompt);
+    const domainKeywords = [
+      "book",
+      "books",
+      "author",
+      "authors",
+      "publisher",
+      "publishers",
+      "novel",
+      "story",
+      "stories",
+      "read",
+      "reading",
+      "genre",
+      "category",
+      "price",
+      "buy",
+      "cart",
+      "fiction",
+      "non fiction",
+      "finance",
+      "romance",
+      "mythology",
+    ];
+
+    if (domainKeywords.some((keyword) => text.includes(keyword))) {
+      return true;
+    }
+
+    const hasAuthorMention = authors.some((author) => {
+      const name = normalizeText(author?.name || "");
+      return name && text.includes(name);
+    });
+    if (hasAuthorMention) {
+      return true;
+    }
+
+    const hasBookMention = books.some((book) => {
+      const title = normalizeText(getBookTitle(book));
+      return title && text.includes(title);
+    });
+    if (hasBookMention) {
+      return true;
+    }
+
+    return false;
+  }
+
+  buildGreetingResponse(prompt, suggestionBook) {
+    const firstName = "there";
+    const suggestionTitle = suggestionBook ? getBookTitle(suggestionBook) : "The Hidden Hindu 1";
+    const suggestionPrice = suggestionBook
+      ? getBookPrimarySellingPrice(suggestionBook)
+      : null;
+    const pricePart = suggestionPrice ? ` (Rs. ${suggestionPrice})` : "";
+
+    return `Hey ${firstName}! 😊 Welcome to your book corner. I can help you discover books by author, price, category, and theme.\n\nHow are you feeling today, and what kind of read are you in the mood for? ✨\n\nA quick one-book suggestion to start: "${suggestionTitle}"${pricePart}.`;
+  }
+
+  buildOutOfDomainResponse(suggestionBook) {
+    const suggestionTitle = suggestionBook ? getBookTitle(suggestionBook) : "The Hidden Hindu 1";
+    const suggestionPrice = suggestionBook
+      ? getBookPrimarySellingPrice(suggestionBook)
+      : null;
+    const pricePart = suggestionPrice ? ` (Rs. ${suggestionPrice})` : "";
+
+    return `I can only help with books, authors, publishers, pricing, and related catalog queries from this platform. 🙏\n\nIf you want, tell me your favorite genre or budget and I will find the best match for you. Which type of book should I suggest next? 📚\n\nSingle-book suggestion: "${suggestionTitle}"${pricePart}.`;
+  }
+
   buildGenerativeText(
     prompt,
     matchedBooks,
@@ -854,6 +1139,26 @@ class LLMEngine {
     const { books, authors } = await this.fetchCatalog();
     if (!books.length) {
       throw new Error("No books found in the database API response.");
+    }
+
+    const suggestionBook = books[0] || null;
+
+    if (this.isGreetingPrompt(prompt)) {
+      const greetingText = this.buildGreetingResponse(prompt, suggestionBook);
+      return {
+        result: truncateWords(greetingText, Math.max(80, maxNewTokens)),
+        matched_books: suggestionBook ? [this.normalizeBook(suggestionBook)] : [],
+        matched_authors: [],
+      };
+    }
+
+    if (!this.isInDomainPrompt(prompt, books, authors)) {
+      const restrictedText = this.buildOutOfDomainResponse(suggestionBook);
+      return {
+        result: truncateWords(restrictedText, Math.max(80, maxNewTokens)),
+        matched_books: suggestionBook ? [this.normalizeBook(suggestionBook)] : [],
+        matched_authors: [],
+      };
     }
 
     const matchedBooks = await this.matchBooks(prompt, books);
