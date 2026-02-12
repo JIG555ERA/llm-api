@@ -33,12 +33,17 @@ app.post("/generate", async (req, res) => {
       value.temperature
     );
 
-    return res.json({
+    const response = {
       result: generation.result,
       token_usage: generation.result.split(/\s+/).filter(Boolean).length,
       matched_books: generation.matched_books,
-      matched_authors: generation.matched_authors,
-    });
+    };
+
+    if (Array.isArray(generation.matched_authors) && generation.matched_authors.length > 0) {
+      response.matched_authors = generation.matched_authors;
+    }
+
+    return res.json(response);
   } catch (error) {
     return res.status(500).json({
       detail: error.message,

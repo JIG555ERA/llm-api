@@ -1,6 +1,7 @@
 const MODEL_ID = "database-grounded-generator-v2";
 const DEFAULT_BOOKS_API_URL = "https://admin.ylw.co.in/api/v1/books/all";
 const DEFAULT_AUTHORS_API_URL = "https://admin.ylw.co.in/api/v1/authors/all";
+const DEFAULT_GOOGLE_BOOKS_API = "https://www.googleapis.com/books/v1/volumes";
 const DEFAULT_WIKIPEDIA_API = "https://en.wikipedia.org/w/api.php";
 
 function stripLinks(text) {
@@ -229,11 +230,53 @@ function themeSimilarity(promptThemeScore, bookThemeScore) {
   return score;
 }
 
+function detectIntent(promptText) {
+  const lower = String(promptText || "").toLowerCase();
+  return {
+    asksAuthor: /(author|wrote|written by|writer|pen name)/i.test(lower),
+    asksCharacters: /(character|characters|who is|who are|protagonist|villain)/i.test(lower),
+    asksPrice: /(price|cost|budget|cheap|expensive|purchase|buy)/i.test(lower),
+    asksFinance: /(finance|financial|money|wealth|invest|investment)/i.test(lower),
+    asksRomance: /(romance|love|girlfriend|boyfriend|relationship|couple)/i.test(lower),
+    asksMythology: /(mythology|hindu|immortality|nagendra|shastri|ancient epic)/i.test(lower),
+  };
+}
+
+function getBookAuthorNames(book) {
+  if (!Array.isArray(book?.authors)) {
+    return [];
+  }
+  return book.authors
+    .map((author) => {
+      if (typeof author === "string") {
+        return author.trim();
+      }
+      return String(author?.name || "").trim();
+    })
+    .filter(Boolean);
+}
+
+function getBookDescription(book) {
+  return String(book?.description || "");
+}
+
+function getBookPrimarySellingPrice(book) {
+  if (Array.isArray(book?.price) && book.price[0]?.selling) {
+    return book.price[0].selling;
+  }
+  if (book?.price && typeof book.price === "object" && book.price.selling) {
+    return book.price.selling;
+  }
+  return null;
+}
+
 class LLMEngine {
   constructor() {
     this.modelId = MODEL_ID;
     this.booksApiUrl = process.env.BOOKS_API_URL || DEFAULT_BOOKS_API_URL;
     this.authorsApiUrl = process.env.AUTHORS_API_URL || DEFAULT_AUTHORS_API_URL;
+    this.googleBooksApi = process.env.GOOGLE_BOOKS_API_BASE || DEFAULT_GOOGLE_BOOKS_API;
+    this.googleBooksApiKey = process.env.GOOGLE_BOOKS_API_KEY || "";
     this.wikipediaApi = process.env.WIKIPEDIA_API_BASE || DEFAULT_WIKIPEDIA_API;
     this.cache = {
       books: [],
@@ -246,6 +289,85 @@ class LLMEngine {
     console.log(`Engine configured: ${this.modelId}`);
     console.log(`Books source: ${this.booksApiUrl}`);
     console.log(`Authors source: ${this.authorsApiUrl}`);
+    console.log(`Google Books source: ${this.googleBooksApi}`);
+  }
+
+  buildGoogleBooksUrl(query) {
+    const params = new URLSearchParams({
+      q: query,
+      maxResults: "10",
+      printType: "books",
+      projection: "lite",
+      langRestrict: "en",
+    });
+    if (this.googleBooksApiKey) {
+      params.set("key", this.googleBooksApiKey);
+    }
+    return `${this.googleBooksApi}?${params.toString()}`;
+  }
+
+  async fetchGoogleHints(prompt) {
+    const url = this.buildGoogleBooksUrl(prompt);
+    const response = await fetch(url, {
+      method: "GET",
+      headers: {
+        Accept: "application/json",
+      },
+    });
+    if (!response.ok) {
+      return {
+        hintTokens: new Set(),
+        titleTokenSets: [],
+        authors: new Set(),
+        categories: new Set(),
+      };
+    }
+
+    const payload = await response.json();
+    const items = Array.isArray(payload?.items) ? payload.items : [];
+
+    const hintTokens = new Set();
+    const titleTokenSets = [];
+    const authors = new Set();
+    const categories = new Set();
+
+    for (const item of items) {
+      const info = item?.volumeInfo || {};
+      const title = stripLinks(info.title || "");
+      const description = stripLinks(info.description || "");
+      const titleTokens = new Set(tokenize(title));
+      titleTokenSets.push(titleTokens);
+
+      for (const token of tokenize(`${title} ${description}`)) {
+        hintTokens.add(token);
+      }
+
+      if (Array.isArray(info.authors)) {
+        for (const name of info.authors) {
+          const cleanName = stripLinks(name).toLowerCase();
+          if (cleanName) {
+            authors.add(cleanName);
+          }
+          for (const token of tokenize(cleanName)) {
+            hintTokens.add(token);
+          }
+        }
+      }
+
+      if (Array.isArray(info.categories)) {
+        for (const category of info.categories) {
+          const cleanCategory = stripLinks(category).toLowerCase();
+          if (cleanCategory) {
+            categories.add(cleanCategory);
+          }
+          for (const token of tokenize(cleanCategory)) {
+            hintTokens.add(token);
+          }
+        }
+      }
+    }
+
+    return { hintTokens, titleTokenSets, authors, categories };
   }
 
   async fetchJSON(url) {
@@ -299,39 +421,16 @@ class LLMEngine {
   }
 
   normalizeBook(book) {
-    const price = Array.isArray(book?.price) && book.price[0] ? book.price[0] : null;
-    const description = stripLinks(book?.description);
-    return {
-      id: book?.id ?? null,
-      title: stripLinks(book?.title),
-      description,
-      language: stripLinks(book?.language),
-      authors: Array.isArray(book?.authors)
-        ? book.authors.map((author) => stripLinks(author?.name)).filter(Boolean)
-        : [],
-      categories: Array.isArray(book?.categories)
-        ? book.categories.map((category) => stripLinks(category?.name)).filter(Boolean)
-        : [],
-      characters: extractCharacterCandidates(description),
-      price: {
-        selling: price?.selling ?? null,
-        purchase: price?.purchase ?? null,
-      },
-    };
+    const rawBook = JSON.parse(JSON.stringify(book || {}));
+    rawBook.characters = extractCharacterCandidates(getBookDescription(rawBook));
+    return rawBook;
   }
 
   normalizeAuthor(author) {
-    return {
-      id: author?.id ?? null,
-      name: stripLinks(author?.name),
-      pen_name: stripLinks(author?.pen_name),
-      bio: stripLinks(author?.bio),
-      profile_pic: author?.profile_pic || null,
-      book_count: author?.book_count ?? 0,
-    };
+    return JSON.parse(JSON.stringify(author || {}));
   }
 
-  scoreBook(book, promptLower, promptTokensSet) {
+  scoreBook(book, promptLower, promptTokensSet, googleHints, intent) {
     const title = String(book?.title || "").toLowerCase();
     const description = String(book?.description || "").toLowerCase();
     const authors = Array.isArray(book?.authors)
@@ -390,6 +489,54 @@ class LLMEngine {
       score -= 35;
     }
 
+    if (intent?.asksFinance) {
+      if (bookIsFinanceHeavy || /\bfinance|financial|money|wealth|rich dad\b/i.test(`${title} ${description}`)) {
+        score += 140;
+      } else {
+        score -= 60;
+      }
+    }
+    if (intent?.asksRomance) {
+      if (bookIsRomanceHeavy) {
+        score += 95;
+      } else {
+        score -= 45;
+      }
+    }
+    if (intent?.asksMythology) {
+      if (bookIsMythologyHeavy || /\bhidden hindu|mritsanjeevani|om shastri|nagendra\b/i.test(`${title} ${description}`)) {
+        score += 110;
+      } else {
+        score -= 45;
+      }
+    }
+
+    if (googleHints) {
+      const localTitleTokens = new Set(tokenize(title));
+      const localAuthorSet = new Set(authors);
+      const localCategorySet = new Set(categories);
+
+      for (const remoteTitleTokens of googleHints.titleTokenSets) {
+        const titleMatch = sharedTokenCount(localTitleTokens, remoteTitleTokens);
+        score += titleMatch * 8;
+      }
+
+      for (const authorName of localAuthorSet) {
+        if (googleHints.authors.has(authorName)) {
+          score += 45;
+        }
+      }
+
+      for (const localCategory of localCategorySet) {
+        for (const remoteCategory of googleHints.categories) {
+          const localTokens = new Set(tokenize(localCategory));
+          const remoteTokens = new Set(tokenize(remoteCategory));
+          const categoryMatch = sharedTokenCount(localTokens, remoteTokens);
+          score += categoryMatch * 6;
+        }
+      }
+    }
+
     return score;
   }
 
@@ -411,22 +558,24 @@ class LLMEngine {
     score += sharedTokenCount(promptTokensSet, authorTokens) * 8;
 
     const matchedBookAuthors = new Set(
-      matchedBooks.flatMap((book) => (Array.isArray(book?.authors) ? book.authors : []))
+      matchedBooks.flatMap((book) => getBookAuthorNames(book))
     );
     if (matchedBookAuthors.has(author?.name)) {
-      score += 40;
+      score += 12;
     }
 
     return score;
   }
 
-  matchBooks(prompt, books, limit = 5) {
+  async matchBooks(prompt, books, limit = 5) {
     const promptLower = String(prompt || "").toLowerCase();
     const promptTokensSet = new Set(tokenize(prompt));
+    const intent = detectIntent(prompt);
+    const googleHints = await this.fetchGoogleHints(prompt);
 
     const scored = books
       .map((book) => ({
-        score: this.scoreBook(book, promptLower, promptTokensSet),
+        score: this.scoreBook(book, promptLower, promptTokensSet, googleHints, intent),
         book,
       }))
       .sort((a, b) => b.score - a.score);
@@ -442,6 +591,7 @@ class LLMEngine {
   matchAuthors(prompt, authors, matchedBooks, limit = 5) {
     const promptLower = String(prompt || "").toLowerCase();
     const promptTokensSet = new Set(tokenize(prompt));
+    const intent = detectIntent(prompt);
 
     const scored = authors
       .map((author) => ({
@@ -450,8 +600,22 @@ class LLMEngine {
       }))
       .sort((a, b) => b.score - a.score);
 
-    const strongMatches = scored.filter((item) => item.score > 0).slice(0, limit);
-    return strongMatches.map((item) => this.normalizeAuthor(item.author));
+    const minimumAuthorScore = intent.asksAuthor ? 20 : 65;
+    const strongMatches = scored.filter((item) => item.score >= minimumAuthorScore).slice(0, limit);
+    if (strongMatches.length) {
+      return strongMatches.map((item) => this.normalizeAuthor(item.author));
+    }
+
+    // Fallback: if top matched books have known author names in DB, return those authors.
+    const matchedBookAuthorNames = new Set(
+      matchedBooks.flatMap((book) => getBookAuthorNames(book))
+    );
+    const fallback = authors
+      .filter((author) => matchedBookAuthorNames.has(stripLinks(author?.name)))
+      .slice(0, limit)
+      .map((author) => this.normalizeAuthor(author));
+
+    return fallback;
   }
 
   async fetchWikipediaExtract(query) {
@@ -524,8 +688,9 @@ class LLMEngine {
       if (!firstBook) {
         return "I could not confirm the author from the current catalog data.";
       }
-      const authorText = firstBook.authors.length
-        ? firstBook.authors.join(", ")
+      const authorNames = getBookAuthorNames(firstBook);
+      const authorText = authorNames.length
+        ? authorNames.join(", ")
         : "author details are not listed";
       return `For "${firstBook.title}", the listed author is ${authorText}.`;
     }
@@ -536,13 +701,13 @@ class LLMEngine {
   }
 
   buildPriceAnswer(matchedBooks) {
-    const priced = matchedBooks.filter((book) => book?.price?.selling);
+    const priced = matchedBooks.filter((book) => getBookPrimarySellingPrice(book));
     if (!priced.length) {
       return "I found matching books, but selling prices are currently not listed for them.";
     }
     const lines = priced
       .slice(0, 3)
-      .map((book) => `${book.title}: Rs. ${book.price.selling}`)
+      .map((book) => `${book.title}: Rs. ${getBookPrimarySellingPrice(book)}`)
       .join("; ");
     return `Here are the latest listed prices from your catalog: ${lines}.`;
   }
@@ -556,8 +721,9 @@ class LLMEngine {
       : `I understood your request about "${cleanPrompt}" and checked your catalog.`;
 
     const bookLines = matchedBooks.slice(0, 3).map((book, idx) => {
-      const authorText = book.authors.length ? book.authors.join(", ") : "Unknown author";
-      const description = truncateWords(book.description || "", 26);
+      const authorNames = getBookAuthorNames(book);
+      const authorText = authorNames.length ? authorNames.join(", ") : "Unknown author";
+      const description = truncateWords(getBookDescription(book), 26);
       return `${idx + 1}. ${book.title} by ${authorText} - ${description}`;
     });
 
@@ -573,29 +739,24 @@ class LLMEngine {
   }
 
   buildGenerativeText(prompt, matchedBooks, matchedAuthors, wikiContext, maxNewTokens) {
-    const promptLower = String(prompt || "").toLowerCase();
-    const asksAuthor = /(author|wrote|written by|writer|pen name)/i.test(promptLower);
-    const asksCharacters = /(character|characters|who is|who are|protagonist|villain)/i.test(
-      promptLower
-    );
-    const asksPrice = /(price|cost|budget|cheap|expensive|purchase|buy)/i.test(promptLower);
+    const intent = detectIntent(prompt);
 
     let response = "";
-    if (asksCharacters) {
+    if (intent.asksCharacters) {
       response = `${this.buildCharacterAnswer(matchedBooks)} ${this.buildGeneralBookAnswer(
         prompt,
         matchedBooks,
         matchedAuthors,
         wikiContext
       )}`;
-    } else if (asksAuthor) {
+    } else if (intent.asksAuthor) {
       response = `${this.buildAuthorAnswer(matchedAuthors, matchedBooks)} ${this.buildGeneralBookAnswer(
         prompt,
         matchedBooks,
         matchedAuthors,
         wikiContext
       )}`;
-    } else if (asksPrice) {
+    } else if (intent.asksPrice) {
       response = `${this.buildPriceAnswer(matchedBooks)} ${this.buildGeneralBookAnswer(
         prompt,
         matchedBooks,
@@ -616,7 +777,7 @@ class LLMEngine {
       throw new Error("No books found in the database API response.");
     }
 
-    const matchedBooks = this.matchBooks(prompt, books);
+    const matchedBooks = await this.matchBooks(prompt, books);
     const matchedAuthors = this.matchAuthors(prompt, authors, matchedBooks);
 
     const wikiQuery = matchedBooks[0]?.title || matchedAuthors[0]?.name || prompt;

@@ -23,6 +23,10 @@ function validateGenerationRequest(body) {
       prompt,
       max_tokens: maxTokens,
       temperature,
+      session_id:
+        typeof body?.session_id === "string" && body.session_id.trim()
+          ? body.session_id.trim()
+          : "default",
     },
   };
 }
