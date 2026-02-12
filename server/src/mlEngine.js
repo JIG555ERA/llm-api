@@ -4,6 +4,7 @@ const DEFAULT_AUTHORS_API_URL = "https://admin.ylw.co.in/api/v1/authors/all";
 const DEFAULT_GOOGLE_BOOKS_API = "https://www.googleapis.com/books/v1/volumes";
 const DEFAULT_OPEN_LIBRARY_API = "https://openlibrary.org/search.json";
 const DEFAULT_WIKIPEDIA_API = "https://en.wikipedia.org/w/api.php";
+const DEFAULT_LLAMA_MODEL = "meta-llama/Llama-3.1-8B-Instruct";
 
 function stripLinks(text) {
   return String(text || "")
@@ -315,6 +316,29 @@ function getBookTitle(book) {
   return String(book?.title || "").trim();
 }
 
+function pickRandom(items) {
+  if (!Array.isArray(items) || items.length === 0) {
+    return "";
+  }
+  return items[Math.floor(Math.random() * items.length)];
+}
+
+function cosineSimilarity(a, b) {
+  if (!a || !b || a.length !== b.length || a.length === 0) {
+    return 0;
+  }
+  let dot = 0;
+  let normA = 0;
+  let normB = 0;
+  for (let i = 0; i < a.length; i += 1) {
+    dot += a[i] * b[i];
+    normA += a[i] * a[i];
+    normB += b[i] * b[i];
+  }
+  const denom = Math.sqrt(normA) * Math.sqrt(normB);
+  return denom > 0 ? dot / denom : 0;
+}
+
 class LLMEngine {
   constructor() {
     this.modelId = MODEL_ID;
@@ -324,10 +348,19 @@ class LLMEngine {
     this.googleBooksApiKey = process.env.GOOGLE_BOOKS_API_KEY || "";
     this.openLibraryApi = process.env.OPEN_LIBRARY_API_BASE || DEFAULT_OPEN_LIBRARY_API;
     this.wikipediaApi = process.env.WIKIPEDIA_API_BASE || DEFAULT_WIKIPEDIA_API;
+    this.llamaModel = process.env.LLAMA_MODEL_ID || DEFAULT_LLAMA_MODEL;
+    this.hfToken = process.env.HF_API_TOKEN || process.env.HUGGINGFACEHUB_API_TOKEN || "";
     this.cache = {
       books: [],
       authors: [],
       updatedAt: 0,
+    };
+    this.semantic = {
+      enabled: true,
+      extractor: null,
+      modelId: process.env.TRANSFORMERS_MODEL_ID || "Xenova/all-MiniLM-L6-v2",
+      loadingPromise: null,
+      intentVectors: null,
     };
   }
 
@@ -337,6 +370,125 @@ class LLMEngine {
     console.log(`Authors source: ${this.authorsApiUrl}`);
     console.log(`Google Books source: ${this.googleBooksApi}`);
     console.log(`OpenLibrary source: ${this.openLibraryApi}`);
+    console.log(`Transformers NLP: ${this.semantic.enabled ? "enabled" : "disabled"}`);
+    console.log(`Generative model: ${this.llamaModel}`);
+  }
+
+  async getSemanticExtractor() {
+    if (!this.semantic.enabled) {
+      return null;
+    }
+    if (this.semantic.extractor) {
+      return this.semantic.extractor;
+    }
+    if (this.semantic.loadingPromise) {
+      return this.semantic.loadingPromise;
+    }
+
+    this.semantic.loadingPromise = (async () => {
+      const { pipeline } = await import("@xenova/transformers");
+      const extractor = await pipeline("feature-extraction", this.semantic.modelId);
+      this.semantic.extractor = extractor;
+      return extractor;
+    })();
+
+    try {
+      return await this.semantic.loadingPromise;
+    } catch (error) {
+      this.semantic.enabled = false;
+      return null;
+    } finally {
+      this.semantic.loadingPromise = null;
+    }
+  }
+
+  async embedText(text) {
+    const extractor = await this.getSemanticExtractor();
+    if (!extractor) {
+      return null;
+    }
+    const output = await extractor(String(text || ""), {
+      pooling: "mean",
+      normalize: true,
+    });
+    if (!output?.data) {
+      return null;
+    }
+    return Array.from(output.data);
+  }
+
+  async semanticRerank(prompt, candidates) {
+    if (!this.semantic.enabled || !candidates.length) {
+      return candidates;
+    }
+
+    const promptVector = await this.embedText(prompt);
+    if (!promptVector) {
+      return candidates;
+    }
+
+    const reranked = [];
+    for (const item of candidates) {
+      const semanticText = `${item?.book?.title || ""} ${item?.book?.description || ""} ${getBookAuthorNames(item?.book).join(" ")} ${getBookCategoryNames(item?.book).join(" ")}`;
+      const bookVector = await this.embedText(semanticText);
+      const semanticScore = bookVector ? cosineSimilarity(promptVector, bookVector) : 0;
+      reranked.push({
+        ...item,
+        score: item.score + semanticScore * 180,
+      });
+    }
+
+    return reranked.sort((a, b) => b.score - a.score);
+  }
+
+  async getIntentVectors() {
+    if (this.semantic.intentVectors) {
+      return this.semantic.intentVectors;
+    }
+
+    const labels = {
+      greeting: "hello hi good morning good evening hey there",
+      author: "who wrote this book author writer pen name",
+      price: "price under budget cheap costly expensive buy",
+      character: "main character protagonist villain cast in story",
+      publisher: "publisher publication publishing house imprint",
+      recommendation: "suggest top best books recommend reading list",
+      general: "complex question detailed explanation analysis",
+    };
+
+    const entries = Object.entries(labels);
+    const vectors = {};
+    for (const [key, text] of entries) {
+      vectors[key] = await this.embedText(text);
+    }
+    this.semantic.intentVectors = vectors;
+    return vectors;
+  }
+
+  async decideWithTransformers(prompt) {
+    const promptVector = await this.embedText(prompt);
+    if (!promptVector) {
+      const fallbackIntent = detectIntent(prompt);
+      if (fallbackIntent.asksAuthor) return { mode: "author", confidence: 0.5 };
+      if (fallbackIntent.asksPrice) return { mode: "price", confidence: 0.5 };
+      if (fallbackIntent.asksCharacters) return { mode: "character", confidence: 0.5 };
+      if (fallbackIntent.asksPublisher) return { mode: "publisher", confidence: 0.5 };
+      return { mode: "general", confidence: 0.4 };
+    }
+
+    const vectors = await this.getIntentVectors();
+    const scores = Object.entries(vectors).map(([mode, vec]) => ({
+      mode,
+      score: vec ? cosineSimilarity(promptVector, vec) : -1,
+    }));
+    scores.sort((a, b) => b.score - a.score);
+    const best = scores[0] || { mode: "general", score: 0 };
+
+    return {
+      mode: best.mode,
+      confidence: best.score,
+      scores,
+    };
   }
 
   buildGoogleBooksUrl(query) {
@@ -555,14 +707,15 @@ class LLMEngine {
     const promptNorm = normalizeText(promptText);
 
     const maxPriceMatch = promptText.match(
-      /\b(?:under|below|less than|upto|up to)\s*(?:rs\.?|inr)?\s*(\d+(?:\.\d+)?)\b/i
+      /\b(under|below|less than|upto|up to)\s*(?:rs\.?|inr)?\s*(\d+(?:\.\d+)?)\b/i
     );
     const minPriceMatch = promptText.match(
       /\b(?:above|over|more than|greater than)\s*(?:rs\.?|inr)?\s*(\d+(?:\.\d+)?)\b/i
     );
 
-    const maxPrice = maxPriceMatch ? toNumberOrNull(maxPriceMatch[1]) : null;
+    const maxPrice = maxPriceMatch ? toNumberOrNull(maxPriceMatch[2]) : null;
     const minPrice = minPriceMatch ? toNumberOrNull(minPriceMatch[1]) : null;
+    const maxPriceStrict = !!maxPriceMatch && !/(upto|up to)/i.test(maxPriceMatch[1]);
     const hasPriceConstraint = maxPrice !== null || minPrice !== null;
 
     const allCategories = new Set(
@@ -590,6 +743,7 @@ class LLMEngine {
     return {
       maxPrice,
       minPrice,
+      maxPriceStrict,
       hasPriceConstraint,
       explicitCategories,
       genreHints,
@@ -649,7 +803,12 @@ class LLMEngine {
 
     if (constraints.hasPriceConstraint) {
       if (sellingPrice !== null) {
-        const maxOkay = constraints.maxPrice === null || sellingPrice <= constraints.maxPrice;
+        const maxOkay =
+          constraints.maxPrice === null
+            ? true
+            : constraints.maxPriceStrict
+              ? sellingPrice < constraints.maxPrice
+              : sellingPrice <= constraints.maxPrice;
         const minOkay = constraints.minPrice === null || sellingPrice >= constraints.minPrice;
         hits.price = maxOkay && minOkay;
       } else {
@@ -859,13 +1018,31 @@ class LLMEngine {
       .sort((a, b) => b.score - a.score);
 
     const hardPassed = scored.filter((item) => item.hardPass);
-    if (constraints.hasHardFilters && !hardPassed.length) {
-      return [];
-    }
 
     const pool = hardPassed.length ? hardPassed : scored;
-    const maxFieldCount = pool.length ? Math.max(...pool.map((item) => item.matchedFieldCount)) : 0;
-    const strongMatches = pool
+    const semanticWindow = pool.slice(0, Math.min(15, pool.length));
+    const semanticallyRerankedTop = await this.semanticRerank(prompt, semanticWindow);
+    const seenIds = new Set();
+    const mergedPool = [];
+    for (const item of semanticallyRerankedTop) {
+      const id = item?.book?.id;
+      if (id !== undefined && id !== null) {
+        seenIds.add(id);
+      }
+      mergedPool.push(item);
+    }
+    for (const item of pool) {
+      const id = item?.book?.id;
+      if (id !== undefined && id !== null && seenIds.has(id)) {
+        continue;
+      }
+      mergedPool.push(item);
+    }
+
+    const maxFieldCount = mergedPool.length
+      ? Math.max(...mergedPool.map((item) => item.matchedFieldCount))
+      : 0;
+    const strongMatches = mergedPool
       .filter((item) => item.score > 0 && item.matchedFieldCount >= Math.max(1, maxFieldCount - 1))
       .slice(0, limit);
 
@@ -906,12 +1083,60 @@ class LLMEngine {
     return fallback;
   }
 
-  postFilterByIntent(prompt, matchedBooks, matchedAuthors) {
+  postFilterByIntent(prompt, matchedBooks, matchedAuthors, aiMode = "general") {
     const intent = detectIntent(prompt);
+    const modeHint = aiMode || (intent.asksAuthor
+      ? "author"
+      : intent.asksPublisher
+        ? "publisher"
+        : intent.asksPrice
+          ? "price"
+          : "general");
+    const constraints = this.parseQueryConstraints(prompt, this.cache.books || [], this.cache.authors || []);
     let books = [...matchedBooks];
     let authors = [...matchedAuthors];
 
-    if (intent.asksAuthor) {
+    // Apply strict constraint filters so final payload matches user intent.
+    books = books.filter((book) => {
+      const price = toNumberOrNull(getBookPrimarySellingPrice(book));
+      const authorNames = getBookAuthorNames(book).map((n) => normalizeText(n));
+      const categoryNames = getBookCategoryNames(book).map((n) => normalizeText(n));
+      const searchable = normalizeText(
+        `${getBookTitle(book)} ${getBookDescription(book)} ${authorNames.join(" ")} ${categoryNames.join(" ")}`
+      );
+
+      if (constraints.hasPriceConstraint) {
+        if (price === null) return false;
+        if (constraints.maxPrice !== null) {
+          const maxOk = constraints.maxPriceStrict ? price < constraints.maxPrice : price <= constraints.maxPrice;
+          if (!maxOk) return false;
+        }
+        if (constraints.minPrice !== null && price < constraints.minPrice) return false;
+      }
+
+      if (constraints.mentionedAuthors.length) {
+        const match = constraints.mentionedAuthors.some((name) =>
+          authorNames.includes(normalizeText(name))
+        );
+        if (!match) return false;
+      }
+
+      if (constraints.explicitCategories.length) {
+        const match = constraints.explicitCategories.some((cat) =>
+          categoryNames.includes(normalizeText(cat))
+        );
+        if (!match) return false;
+      }
+
+      if (constraints.genreHints.length) {
+        const match = constraints.genreHints.some((hint) => searchable.includes(normalizeText(hint)));
+        if (!match) return false;
+      }
+
+      return true;
+    });
+
+    if (modeHint === "author") {
       const authorNameSet = new Set(authors.map((a) => normalizeText(a?.name || "")));
       books = books.filter((book) => {
         const names = getBookAuthorNames(book).map((n) => normalizeText(n));
@@ -934,18 +1159,119 @@ class LLMEngine {
       }
     }
 
-    if (!intent.asksAuthor && !intent.asksPublisher) {
+    if (modeHint !== "author" && modeHint !== "publisher") {
       authors = [];
     }
 
+    const requestedCount = this.extractRequestedCount(prompt, 3);
     return {
-      books: books.slice(0, 5),
+      books: books.slice(0, requestedCount),
       authors: authors.slice(0, 3),
       display: {
         show_book_cards: books.length > 0,
         show_author_cards: authors.length > 0,
       },
     };
+  }
+
+  extractRequestedCount(prompt, fallback = 3) {
+    const text = String(prompt || "").toLowerCase();
+    if (/\b(best|top)\s+book\b/.test(text) || /\ba\s+book\b/.test(text)) {
+      return 1;
+    }
+    const match = String(prompt || "").match(/\b(?:top|best|show|give|list)\s+(\d+)\b/i);
+    if (!match) {
+      return fallback;
+    }
+    const n = Number(match[1]);
+    if (!Number.isFinite(n)) {
+      return fallback;
+    }
+    return Math.max(1, Math.min(10, n));
+  }
+
+  slimBookForIntent(book, mode) {
+    if (!book) {
+      return book;
+    }
+    if (mode === "author") {
+      return {
+        id: book.id,
+        title: getBookTitle(book),
+        authors: book.authors,
+      };
+    }
+    if (mode === "price") {
+      return {
+        id: book.id,
+        title: getBookTitle(book),
+        price: book.price,
+        authors: book.authors,
+      };
+    }
+    return {
+      id: book.id,
+      title: getBookTitle(book),
+      description: truncateWords(getBookDescription(book), 40),
+      image: book.image,
+      authors: book.authors,
+      price: book.price,
+      categories: book.categories,
+    };
+  }
+
+  slimAuthorForIntent(author, mode) {
+    if (!author) {
+      return author;
+    }
+    if (mode === "author" || mode === "publisher") {
+      return author;
+    }
+    return {
+      id: author.id,
+      name: author.name,
+      pen_name: author.pen_name || null,
+    };
+  }
+
+  async generateWithLlama(prompt, context, maxNewTokens) {
+    if (!this.hfToken) {
+      return null;
+    }
+    const endpoint = `https://api-inference.huggingface.co/models/${this.llamaModel}`;
+    const systemInstruction =
+      "You are a smart bookstore AI assistant. Produce rich, engaging, human-like long-form answers grounded only in provided catalog context. Avoid rigid templates and avoid hallucinations.";
+    const composedPrompt = `<|system|>\n${systemInstruction}\n<|user|>\nUser query: ${prompt}\nContext: ${context}\n<|assistant|>\n`;
+
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${this.hfToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        inputs: composedPrompt,
+        parameters: {
+          max_new_tokens: Math.min(900, Math.max(220, maxNewTokens)),
+          temperature: 0.72,
+          top_p: 0.92,
+          return_full_text: false,
+        },
+        options: {
+          wait_for_model: true,
+        },
+      }),
+    });
+
+    if (!response.ok) {
+      return null;
+    }
+    const payload = await response.json();
+    const text = Array.isArray(payload) ? payload?.[0]?.generated_text : null;
+    if (!text || typeof text !== "string") {
+      return null;
+    }
+    return stripLinks(text.trim());
   }
 
   async fetchWikipediaExtract(query) {
@@ -1225,45 +1551,144 @@ class LLMEngine {
     matchedAuthors,
     wikiContext,
     maxNewTokens,
-    catalogInsights
+    catalogInsights,
+    aiDecision
   ) {
-    const intent = detectIntent(prompt);
-    const style = ["concise", "storylike", "advisor"][Math.abs(prompt.length) % 3];
+    const mode = aiDecision?.mode || "general";
+    const confidence = Number.isFinite(aiDecision?.confidence) ? aiDecision.confidence : 0;
+    const openers = [
+      `I processed your requirement and selected the most relevant result set.`,
+      `I understood your request and picked matches using intent plus semantic ranking.`,
+      `I parsed your constraints and returned only the strongest fit.`,
+    ];
 
-    let response = "";
-    if (intent.asksCharacters) {
-      response = `${this.buildCharacterAnswer(matchedBooks)} ${this.buildGeneralBookAnswer(
-        prompt,
-        matchedBooks,
-        matchedAuthors,
-        wikiContext
-      )}`;
-    } else if (intent.asksAuthor) {
-      response = `${this.buildAuthorAnswer(matchedAuthors, matchedBooks)} ${this.buildGeneralBookAnswer(
-        prompt,
-        matchedBooks,
-        matchedAuthors,
-        wikiContext
-      )}`;
-    } else if (intent.asksPrice) {
-      response = `${this.buildPriceAnswer(matchedBooks)} ${this.buildGeneralBookAnswer(
-        prompt,
-        matchedBooks,
-        matchedAuthors,
-        wikiContext
-      )}`;
+    const lines = [];
+    const primary = matchedBooks[0];
+    if (!primary) {
+      return "I could not find a clean match for all constraints. Try changing one filter (price, author, category, or genre).";
+    }
+
+    if (mode === "author") {
+      const authorText = matchedAuthors[0]?.name || getBookAuthorNames(primary)[0] || "Unknown author";
+      lines.push(`Author focus: "${primary.title}" is associated with ${authorText}.`);
+      lines.push(
+        `This result is prioritized because author linkage in your catalog is stronger than competing titles for the same query intent.`
+      );
+    } else if (mode === "price") {
+      const priceText = getBookPrimarySellingPrice(primary)
+        ? `Rs. ${getBookPrimarySellingPrice(primary)}`
+        : "price not listed";
+      lines.push(`Price focus: "${primary.title}" is the strongest budget-fit candidate (${priceText}).`);
+      lines.push(
+        `I applied numeric budget filtering first and then semantic relevance ranking, so the shortlist remains accurate to both cost and content intent.`
+      );
+    } else if (mode === "character") {
+      const chars = Array.isArray(primary.characters) ? primary.characters.slice(0, 3).join(", ") : "";
+      lines.push(`Character focus: "${primary.title}"${chars ? ` with likely names ${chars}` : ""}.`);
+      lines.push(
+        `Character extraction is grounded in your catalog descriptions and then validated against semantic context from the query phrasing.`
+      );
     } else {
-      response = this.buildGeneralBookAnswer(prompt, matchedBooks, matchedAuthors, wikiContext);
+      const categoryText = getBookCategoryNames(primary).join(", ") || "Uncategorized";
+      lines.push(`Top recommendation: "${primary.title}" (${categoryText}).`);
+      lines.push(
+        `This selection balances intent similarity, metadata alignment, and multi-source retrieval signals to avoid shallow keyword-only ranking.`
+      );
     }
 
-    if (style === "storylike") {
-      response = `${response}\n\nIf this feels close, I can narrow it down to one perfect pick and why it fits.`;
-    } else if (style === "advisor") {
-      response = `${response}\n\nTell me your budget and mood, and I will shortlist the strongest option.`;
+    const shortlist = matchedBooks.slice(0, 3).map((book, idx) => {
+      const price = getBookPrimarySellingPrice(book);
+      const p = price ? `, Rs. ${price}` : "";
+      return `${idx + 1}) ${book.title}${p}`;
+    });
+    if (shortlist.length > 1) {
+      lines.push(`Shortlist: ${shortlist.join(" | ")}`);
+      lines.push(
+        `Each shortlisted option remains within the highest relevance band after post-filtering constraints and semantic reranking.`
+      );
     }
 
-    response = `${response}\n\n${catalogInsights}\n\nIf you want, I can refine this answer by language, genre, author, or budget.`;
-    return truncateWords(stripLinks(response), Math.max(180, maxNewTokens));
+    if (wikiContext?.extract) {
+      lines.push(`Context signal: ${wikiContext.extract}`);
+    }
+
+    const confidenceTag =
+      confidence >= 0.75 ? "high-confidence" : confidence >= 0.5 ? "moderate-confidence" : "exploratory";
+    lines.push(`Decision profile: ${confidenceTag}.`);
+    lines.push(
+      `If you share one more constraint (tone, depth, pacing, or language), I can generate a highly personalized final recommendation note.`
+    );
+    lines.push(pickRandom([
+      "If you want, I can narrow to one final pick.",
+      "Tell me one extra preference and I will refine instantly.",
+      "I can compare these in one line each if needed.",
+    ]));
+
+    const response = `${pickRandom(openers)} ${lines.join(" ")}`;
+    return truncateWords(stripLinks(response), Math.max(220, maxNewTokens));
+  }
+
+  buildHelpfulInfoBlock(matchedBooks, matchedAuthors, wikiContext, catalogInsights) {
+    const topBook = matchedBooks[0];
+    const topBookTitle = topBook ? getBookTitle(topBook) : "No direct top match";
+    const topBookPrice = topBook ? getBookPrimarySellingPrice(topBook) : null;
+    const topAuthor = matchedAuthors[0]?.name || getBookAuthorNames(topBook || {})[0] || "Unknown";
+    const topCategories = topBook ? getBookCategoryNames(topBook).slice(0, 2).join(", ") : "";
+    const pricedBooks = matchedBooks
+      .map((book) => ({
+        book,
+        price: toNumberOrNull(getBookPrimarySellingPrice(book)),
+      }))
+      .filter((item) => item.price !== null)
+      .sort((a, b) => a.price - b.price);
+    const bestBudget = pricedBooks[0] || null;
+
+    const authorReason = (() => {
+      if (!matchedAuthors.length) {
+        return "No author keyword match was strongly detected for this query.";
+      }
+      const primaryAuthor = matchedAuthors[0]?.name || "";
+      const authorBooks = matchedBooks.filter((book) =>
+        getBookAuthorNames(book).some((name) => name.toLowerCase() === primaryAuthor.toLowerCase())
+      );
+      if (!authorBooks.length) {
+        return `${primaryAuthor} matched from your author API, but book-level author metadata is sparse for some entries.`;
+      }
+      return `${primaryAuthor} is strongly linked to ${authorBooks.length} of the top matched book result(s).`;
+    })();
+
+    const categoryTrend = (() => {
+      const categoryCount = new Map();
+      for (const book of matchedBooks) {
+        for (const category of getBookCategoryNames(book)) {
+          categoryCount.set(category, (categoryCount.get(category) || 0) + 1);
+        }
+      }
+      const top = [...categoryCount.entries()].sort((a, b) => b[1] - a[1])[0];
+      if (!top) {
+        return "No dominant category trend is visible in the current shortlist.";
+      }
+      return `${top[0]} appears most often in your top results (${top[1]} match${top[1] > 1 ? "es" : ""}).`;
+    })();
+
+    const infoLines = [
+      `Helpful info:`,
+      `- Top pick: ${topBookTitle}${topBookPrice ? ` (Rs. ${topBookPrice})` : ""}`,
+      `- Best budget option: ${
+        bestBudget ? `${getBookTitle(bestBudget.book)} (Rs. ${bestBudget.price.toFixed(2)})` : "No listed selling price in matched books"
+      }`,
+      `- Author signal: ${topAuthor}`,
+      `- Strongest author-match reason: ${authorReason}`,
+      topCategories ? `- Primary genre: ${topCategories}` : `- Primary genre: Not clearly tagged`,
+      `- Category trend: ${categoryTrend}`,
+    ];
+
+    if (wikiContext?.extract) {
+      infoLines.push(`- Context highlight: ${truncateWords(wikiContext.extract, 22)}`);
+    }
+
+    infoLines.push(`- Catalog snapshot: ${truncateWords(catalogInsights, 20)}`);
+    return infoLines.join("\n");
   }
 
   async generate(prompt, maxNewTokens = 256) {
@@ -1273,8 +1698,9 @@ class LLMEngine {
     }
 
     const suggestionBook = books[0] || null;
+    const aiDecision = await this.decideWithTransformers(prompt);
 
-    if (this.isGreetingPrompt(prompt)) {
+    if (aiDecision.mode === "greeting" || this.isGreetingPrompt(prompt)) {
       const greetingText = this.buildGreetingResponse(prompt, suggestionBook);
       return {
         result: truncateWords(greetingText, Math.max(80, maxNewTokens)),
@@ -1287,22 +1713,9 @@ class LLMEngine {
       };
     }
 
-    if (!this.isInDomainPrompt(prompt, books, authors)) {
-      const restrictedText = this.buildOutOfDomainResponse(suggestionBook);
-      return {
-        result: truncateWords(restrictedText, Math.max(80, maxNewTokens)),
-        matched_books: suggestionBook ? [this.normalizeBook(suggestionBook)] : [],
-        matched_authors: [],
-        display: {
-          show_book_cards: !!suggestionBook,
-          show_author_cards: false,
-        },
-      };
-    }
-
     const matchedBooksRaw = await this.matchBooks(prompt, books);
     const matchedAuthorsRaw = this.matchAuthors(prompt, authors, matchedBooksRaw);
-    const refined = this.postFilterByIntent(prompt, matchedBooksRaw, matchedAuthorsRaw);
+    const refined = this.postFilterByIntent(prompt, matchedBooksRaw, matchedAuthorsRaw, aiDecision.mode);
     const matchedBooks = refined.books;
     const matchedAuthors = refined.authors;
 
@@ -1310,19 +1723,56 @@ class LLMEngine {
     const wikiContext = await this.fetchWikipediaExtract(wikiQuery);
     const catalogInsights = this.buildCatalogInsights(books, authors);
 
-    const result = this.buildGenerativeText(
+    const richTokenTarget = Math.max(320, maxNewTokens);
+
+    const localResult = this.buildGenerativeText(
       prompt,
       matchedBooks,
       matchedAuthors,
       wikiContext,
-      maxNewTokens,
+      richTokenTarget,
+      catalogInsights,
+      aiDecision
+    );
+
+    const compactContext = JSON.stringify({
+      mode: aiDecision.mode,
+      confidence: aiDecision.confidence,
+      query: prompt,
+      books: matchedBooks.map((book) => ({
+        title: getBookTitle(book),
+        description: truncateWords(getBookDescription(book), 90),
+        author: getBookAuthorNames(book),
+        price: getBookPrimarySellingPrice(book),
+        category: getBookCategoryNames(book),
+        language: book.language || "",
+      })),
+      authors: matchedAuthors.map((a) => ({
+        name: a.name,
+        bio: a.bio || "",
+        book_count: a.book_count || 0,
+      })),
+      wiki_context: wikiContext?.extract || "",
+      catalog_insights: catalogInsights,
+    });
+    const llamaResult = await this.generateWithLlama(prompt, compactContext, richTokenTarget);
+    const coreResult = llamaResult || localResult;
+    const helpfulInfo = this.buildHelpfulInfoBlock(
+      matchedBooks,
+      matchedAuthors,
+      wikiContext,
       catalogInsights
     );
+    const result = `${stripLinks(coreResult)}\n\n${helpfulInfo}`;
+
+    const mode = aiDecision.mode || "general";
+    const shapedBooks = matchedBooks.map((book) => this.slimBookForIntent(book, mode));
+    const shapedAuthors = matchedAuthors.map((author) => this.slimAuthorForIntent(author, mode));
 
     return {
       result,
-      matched_books: matchedBooks,
-      matched_authors: matchedAuthors,
+      matched_books: shapedBooks,
+      matched_authors: shapedAuthors,
       display: refined.display,
     };
   }
