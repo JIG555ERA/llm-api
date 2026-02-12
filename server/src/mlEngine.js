@@ -2,6 +2,7 @@ const MODEL_ID = "database-grounded-generator-v2";
 const DEFAULT_BOOKS_API_URL = "https://admin.ylw.co.in/api/v1/books/all";
 const DEFAULT_AUTHORS_API_URL = "https://admin.ylw.co.in/api/v1/authors/all";
 const DEFAULT_GOOGLE_BOOKS_API = "https://www.googleapis.com/books/v1/volumes";
+const DEFAULT_OPEN_LIBRARY_API = "https://openlibrary.org/search.json";
 const DEFAULT_WIKIPEDIA_API = "https://en.wikipedia.org/w/api.php";
 
 function stripLinks(text) {
@@ -239,6 +240,7 @@ function detectIntent(promptText) {
     asksFinance: /(finance|financial|money|wealth|invest|investment)/i.test(lower),
     asksRomance: /(romance|love|girlfriend|boyfriend|relationship|couple)/i.test(lower),
     asksMythology: /(mythology|hindu|immortality|nagendra|shastri|ancient epic)/i.test(lower),
+    asksPublisher: /(publisher|publication|published by|publishing house)/i.test(lower),
   };
 }
 
@@ -320,6 +322,7 @@ class LLMEngine {
     this.authorsApiUrl = process.env.AUTHORS_API_URL || DEFAULT_AUTHORS_API_URL;
     this.googleBooksApi = process.env.GOOGLE_BOOKS_API_BASE || DEFAULT_GOOGLE_BOOKS_API;
     this.googleBooksApiKey = process.env.GOOGLE_BOOKS_API_KEY || "";
+    this.openLibraryApi = process.env.OPEN_LIBRARY_API_BASE || DEFAULT_OPEN_LIBRARY_API;
     this.wikipediaApi = process.env.WIKIPEDIA_API_BASE || DEFAULT_WIKIPEDIA_API;
     this.cache = {
       books: [],
@@ -333,6 +336,7 @@ class LLMEngine {
     console.log(`Books source: ${this.booksApiUrl}`);
     console.log(`Authors source: ${this.authorsApiUrl}`);
     console.log(`Google Books source: ${this.googleBooksApi}`);
+    console.log(`OpenLibrary source: ${this.openLibraryApi}`);
   }
 
   buildGoogleBooksUrl(query) {
@@ -411,6 +415,78 @@ class LLMEngine {
     }
 
     return { hintTokens, titleTokenSets, authors, categories };
+  }
+
+  buildOpenLibraryUrl(query) {
+    const params = new URLSearchParams({
+      q: query,
+      limit: "10",
+      language: "eng",
+    });
+    return `${this.openLibraryApi}?${params.toString()}`;
+  }
+
+  async fetchOpenLibraryHints(prompt) {
+    const url = this.buildOpenLibraryUrl(prompt);
+    const response = await fetch(url, {
+      method: "GET",
+      headers: { Accept: "application/json" },
+    });
+    if (!response.ok) {
+      return {
+        titleTokenSets: [],
+        authors: new Set(),
+        categories: new Set(),
+      };
+    }
+
+    const payload = await response.json();
+    const docs = Array.isArray(payload?.docs) ? payload.docs : [];
+    const titleTokenSets = [];
+    const authors = new Set();
+    const categories = new Set();
+
+    for (const doc of docs) {
+      const title = stripLinks(doc?.title || "");
+      titleTokenSets.push(new Set(tokenize(title)));
+      for (const name of Array.isArray(doc?.author_name) ? doc.author_name : []) {
+        const clean = stripLinks(name).toLowerCase();
+        if (clean) {
+          authors.add(clean);
+        }
+      }
+      for (const subject of Array.isArray(doc?.subject) ? doc.subject : []) {
+        const clean = stripLinks(subject).toLowerCase();
+        if (clean) {
+          categories.add(clean);
+        }
+      }
+    }
+
+    return { titleTokenSets, authors, categories };
+  }
+
+  async fetchExternalHints(prompt) {
+    const [google, openLibrary] = await Promise.all([
+      this.fetchGoogleHints(prompt).catch(() => ({
+        hintTokens: new Set(),
+        titleTokenSets: [],
+        authors: new Set(),
+        categories: new Set(),
+      })),
+      this.fetchOpenLibraryHints(prompt).catch(() => ({
+        titleTokenSets: [],
+        authors: new Set(),
+        categories: new Set(),
+      })),
+    ]);
+
+    return {
+      hintTokens: google.hintTokens || new Set(),
+      titleTokenSets: [...(google.titleTokenSets || []), ...(openLibrary.titleTokenSets || [])],
+      authors: new Set([...(google.authors || []), ...(openLibrary.authors || [])]),
+      categories: new Set([...(google.categories || []), ...(openLibrary.categories || [])]),
+    };
   }
 
   async fetchJSON(url) {
@@ -763,7 +839,7 @@ class LLMEngine {
     const promptLower = String(prompt || "").toLowerCase();
     const promptTokensSet = new Set(tokenize(prompt));
     const intent = detectIntent(prompt);
-    const googleHints = await this.fetchGoogleHints(prompt);
+    const googleHints = await this.fetchExternalHints(prompt);
     const constraints = this.parseQueryConstraints(prompt, books, this.cache.authors || []);
 
     const scored = books
@@ -828,6 +904,48 @@ class LLMEngine {
       .map((author) => this.normalizeAuthor(author));
 
     return fallback;
+  }
+
+  postFilterByIntent(prompt, matchedBooks, matchedAuthors) {
+    const intent = detectIntent(prompt);
+    let books = [...matchedBooks];
+    let authors = [...matchedAuthors];
+
+    if (intent.asksAuthor) {
+      const authorNameSet = new Set(authors.map((a) => normalizeText(a?.name || "")));
+      books = books.filter((book) => {
+        const names = getBookAuthorNames(book).map((n) => normalizeText(n));
+        if (!names.length) {
+          return false;
+        }
+        if (!authorNameSet.size) {
+          return true;
+        }
+        return names.some((name) => authorNameSet.has(name));
+      });
+
+      if (!authors.length && books.length) {
+        const fallbackNames = new Set(
+          books.flatMap((book) => getBookAuthorNames(book).map((n) => normalizeText(n)))
+        );
+        authors = this.cache.authors
+          .filter((author) => fallbackNames.has(normalizeText(author?.name || "")))
+          .map((author) => this.normalizeAuthor(author));
+      }
+    }
+
+    if (!intent.asksAuthor && !intent.asksPublisher) {
+      authors = [];
+    }
+
+    return {
+      books: books.slice(0, 5),
+      authors: authors.slice(0, 3),
+      display: {
+        show_book_cards: books.length > 0,
+        show_author_cards: authors.length > 0,
+      },
+    };
   }
 
   async fetchWikipediaExtract(query) {
@@ -931,9 +1049,15 @@ class LLMEngine {
       return `I checked your catalog for "${cleanPrompt}" but found no exact matches for all requested filters. Try broadening price, category, or author constraints.`;
     }
 
-    const openLine = topBook
-      ? `I understood your request about "${cleanPrompt}". The strongest match is "${topBook.title}".`
-      : `I understood your request about "${cleanPrompt}" and checked your catalog.`;
+    const openingTemplates = [
+      `I understood your request about "${cleanPrompt}". The strongest match is "${topBook.title}".`,
+      `Got it for "${cleanPrompt}". The top match I found is "${topBook.title}".`,
+      `Based on your query "${cleanPrompt}", the best match right now is "${topBook.title}".`,
+      `For "${cleanPrompt}", the highest-confidence result in your catalog is "${topBook.title}".`,
+      `Nice query: "${cleanPrompt}". The first recommendation I would give is "${topBook.title}".`,
+      `After checking your catalog for "${cleanPrompt}", "${topBook.title}" stands out as the top match.`,
+    ];
+    const openLine = openingTemplates[Math.floor(Math.random() * openingTemplates.length)];
 
     const bookLines = matchedBooks.slice(0, 5).map((book, idx) => {
       const authorNames = getBookAuthorNames(book);
@@ -1082,7 +1206,7 @@ class LLMEngine {
       : null;
     const pricePart = suggestionPrice ? ` (Rs. ${suggestionPrice})` : "";
 
-    return `Hey ${firstName}! 😊 Welcome to your book corner. I can help you discover books by author, price, category, and theme.\n\nHow are you feeling today, and what kind of read are you in the mood for? ✨\n\nA quick one-book suggestion to start: "${suggestionTitle}"${pricePart}.`;
+    return `Hey ${firstName}! :) Welcome to your book corner. I can help you discover books by author, price, category, and theme.\n\nHow are you feeling today, and what kind of read are you in the mood for?\n\nA quick one-book suggestion to start: "${suggestionTitle}"${pricePart}.`;
   }
 
   buildOutOfDomainResponse(suggestionBook) {
@@ -1092,7 +1216,7 @@ class LLMEngine {
       : null;
     const pricePart = suggestionPrice ? ` (Rs. ${suggestionPrice})` : "";
 
-    return `I can only help with books, authors, publishers, pricing, and related catalog queries from this platform. 🙏\n\nIf you want, tell me your favorite genre or budget and I will find the best match for you. Which type of book should I suggest next? 📚\n\nSingle-book suggestion: "${suggestionTitle}"${pricePart}.`;
+    return `I can only help with books, authors, publishers, pricing, and related catalog queries from this platform.\n\nIf you want, tell me your favorite genre or budget and I will find the best match for you. Which type of book should I suggest next?\n\nSingle-book suggestion: "${suggestionTitle}"${pricePart}.`;
   }
 
   buildGenerativeText(
@@ -1104,6 +1228,7 @@ class LLMEngine {
     catalogInsights
   ) {
     const intent = detectIntent(prompt);
+    const style = ["concise", "storylike", "advisor"][Math.abs(prompt.length) % 3];
 
     let response = "";
     if (intent.asksCharacters) {
@@ -1131,6 +1256,12 @@ class LLMEngine {
       response = this.buildGeneralBookAnswer(prompt, matchedBooks, matchedAuthors, wikiContext);
     }
 
+    if (style === "storylike") {
+      response = `${response}\n\nIf this feels close, I can narrow it down to one perfect pick and why it fits.`;
+    } else if (style === "advisor") {
+      response = `${response}\n\nTell me your budget and mood, and I will shortlist the strongest option.`;
+    }
+
     response = `${response}\n\n${catalogInsights}\n\nIf you want, I can refine this answer by language, genre, author, or budget.`;
     return truncateWords(stripLinks(response), Math.max(180, maxNewTokens));
   }
@@ -1149,6 +1280,10 @@ class LLMEngine {
         result: truncateWords(greetingText, Math.max(80, maxNewTokens)),
         matched_books: suggestionBook ? [this.normalizeBook(suggestionBook)] : [],
         matched_authors: [],
+        display: {
+          show_book_cards: !!suggestionBook,
+          show_author_cards: false,
+        },
       };
     }
 
@@ -1158,11 +1293,18 @@ class LLMEngine {
         result: truncateWords(restrictedText, Math.max(80, maxNewTokens)),
         matched_books: suggestionBook ? [this.normalizeBook(suggestionBook)] : [],
         matched_authors: [],
+        display: {
+          show_book_cards: !!suggestionBook,
+          show_author_cards: false,
+        },
       };
     }
 
-    const matchedBooks = await this.matchBooks(prompt, books);
-    const matchedAuthors = this.matchAuthors(prompt, authors, matchedBooks);
+    const matchedBooksRaw = await this.matchBooks(prompt, books);
+    const matchedAuthorsRaw = this.matchAuthors(prompt, authors, matchedBooksRaw);
+    const refined = this.postFilterByIntent(prompt, matchedBooksRaw, matchedAuthorsRaw);
+    const matchedBooks = refined.books;
+    const matchedAuthors = refined.authors;
 
     const wikiQuery = matchedBooks[0]?.title || matchedAuthors[0]?.name || prompt;
     const wikiContext = await this.fetchWikipediaExtract(wikiQuery);
@@ -1181,6 +1323,7 @@ class LLMEngine {
       result,
       matched_books: matchedBooks,
       matched_authors: matchedAuthors,
+      display: refined.display,
     };
   }
 }

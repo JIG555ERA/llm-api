@@ -43,6 +43,10 @@ app.post("/generate", async (req, res) => {
       response.matched_authors = generation.matched_authors;
     }
 
+    if (generation.display) {
+      response.display = generation.display;
+    }
+
     return res.json(response);
   } catch (error) {
     return res.status(500).json({
