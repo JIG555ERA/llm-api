@@ -37,6 +37,7 @@ app.post("/generate", async (req, res) => {
       result: generation.result,
       token_usage: generation.result.split(/\s+/).filter(Boolean).length,
       matched_books: generation.matched_books,
+      matched_authors: generation.matched_authors,
     });
   } catch (error) {
     return res.status(500).json({
