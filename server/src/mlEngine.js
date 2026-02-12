@@ -270,6 +270,11 @@ function getBookPrimarySellingPrice(book) {
   return null;
 }
 
+function toNumberOrNull(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
 class LLMEngine {
   constructor() {
     this.modelId = MODEL_ID;
@@ -720,11 +725,18 @@ class LLMEngine {
       ? `I understood your request about "${cleanPrompt}". The strongest match is "${topBook.title}".`
       : `I understood your request about "${cleanPrompt}" and checked your catalog.`;
 
-    const bookLines = matchedBooks.slice(0, 3).map((book, idx) => {
+    const bookLines = matchedBooks.slice(0, 5).map((book, idx) => {
       const authorNames = getBookAuthorNames(book);
       const authorText = authorNames.length ? authorNames.join(", ") : "Unknown author";
-      const description = truncateWords(getBookDescription(book), 26);
-      return `${idx + 1}. ${book.title} by ${authorText} - ${description}`;
+      const description = truncateWords(getBookDescription(book), 60);
+      const categoryText = Array.isArray(book?.categories)
+        ? book.categories.map((c) => c?.name).filter(Boolean).join(", ")
+        : "";
+      const priceText = getBookPrimarySellingPrice(book)
+        ? ` | Price: Rs. ${getBookPrimarySellingPrice(book)}`
+        : "";
+      const categoryPart = categoryText ? ` | Category: ${categoryText}` : "";
+      return `${idx + 1}. ${book.title} by ${authorText}${categoryPart}${priceText}\n   ${description}`;
     });
 
     const authorLine = matchedAuthors.length
@@ -735,10 +747,77 @@ class LLMEngine {
       ? `Additional context: ${wikiContext.title} - ${wikiContext.extract}`
       : "Additional context: response is based on your internal catalog data.";
 
-    return `${openLine}\n\n${bookLines.join("\n")}\n\n${authorLine}\n${contextLine}`;
+    return `${openLine}\n\nDetailed matches:\n${bookLines.join("\n\n")}\n\n${authorLine}\n${contextLine}`;
   }
 
-  buildGenerativeText(prompt, matchedBooks, matchedAuthors, wikiContext, maxNewTokens) {
+  buildCatalogInsights(books, authors) {
+    const totalBooks = books.length;
+    const totalAuthors = authors.length;
+
+    const categoryCount = new Map();
+    const languageCount = new Map();
+    const prices = [];
+
+    for (const book of books) {
+      const language = String(book?.language || "").trim();
+      if (language) {
+        languageCount.set(language, (languageCount.get(language) || 0) + 1);
+      }
+
+      if (Array.isArray(book?.categories)) {
+        for (const category of book.categories) {
+          const name = String(category?.name || "").trim();
+          if (name) {
+            categoryCount.set(name, (categoryCount.get(name) || 0) + 1);
+          }
+        }
+      }
+
+      const selling = toNumberOrNull(getBookPrimarySellingPrice(book));
+      if (selling !== null) {
+        prices.push(selling);
+      }
+    }
+
+    const topCategories = [...categoryCount.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 3)
+      .map(([name, count]) => `${name} (${count})`)
+      .join(", ");
+
+    const topLanguages = [...languageCount.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 2)
+      .map(([name, count]) => `${name} (${count})`)
+      .join(", ");
+
+    const lowestPrice = prices.length ? Math.min(...prices) : null;
+    const highestPrice = prices.length ? Math.max(...prices) : null;
+
+    const knownAuthor = [...authors]
+      .sort((a, b) => (b?.book_count || 0) - (a?.book_count || 0))[0];
+    const knownAuthorLine = knownAuthor?.name
+      ? `Most represented author currently is ${knownAuthor.name} (${knownAuthor.book_count || 0} books).`
+      : "Author distribution is currently limited in the catalog.";
+
+    const priceLine =
+      lowestPrice !== null && highestPrice !== null
+        ? `Visible selling price range is Rs. ${lowestPrice.toFixed(2)} to Rs. ${highestPrice.toFixed(2)}.`
+        : "Price metadata is limited for some catalog entries.";
+
+    return `Catalog insights: ${totalBooks} books and ${totalAuthors} authors are currently indexed. Top categories: ${
+      topCategories || "not enough category data"
+    }. Main languages: ${topLanguages || "not enough language data"}. ${priceLine} ${knownAuthorLine}`;
+  }
+
+  buildGenerativeText(
+    prompt,
+    matchedBooks,
+    matchedAuthors,
+    wikiContext,
+    maxNewTokens,
+    catalogInsights
+  ) {
     const intent = detectIntent(prompt);
 
     let response = "";
@@ -767,8 +846,8 @@ class LLMEngine {
       response = this.buildGeneralBookAnswer(prompt, matchedBooks, matchedAuthors, wikiContext);
     }
 
-    response = `${response}\n\nIf you want, I can refine this answer by language, genre, author, or budget.`;
-    return truncateWords(stripLinks(response), Math.max(60, maxNewTokens));
+    response = `${response}\n\n${catalogInsights}\n\nIf you want, I can refine this answer by language, genre, author, or budget.`;
+    return truncateWords(stripLinks(response), Math.max(180, maxNewTokens));
   }
 
   async generate(prompt, maxNewTokens = 256) {
@@ -782,13 +861,15 @@ class LLMEngine {
 
     const wikiQuery = matchedBooks[0]?.title || matchedAuthors[0]?.name || prompt;
     const wikiContext = await this.fetchWikipediaExtract(wikiQuery);
+    const catalogInsights = this.buildCatalogInsights(books, authors);
 
     const result = this.buildGenerativeText(
       prompt,
       matchedBooks,
       matchedAuthors,
       wikiContext,
-      maxNewTokens
+      maxNewTokens,
+      catalogInsights
     );
 
     return {
