@@ -1159,7 +1159,20 @@ class LLMEngine {
       }
     }
 
-    if (modeHint !== "author" && modeHint !== "publisher") {
+    const shouldIncludeAuthors =
+      modeHint === "author" ||
+      modeHint === "publisher" ||
+      intent.asksAuthor ||
+      constraints.mentionedAuthors.length > 0;
+
+    if (shouldIncludeAuthors && !authors.length && constraints.mentionedAuthors.length) {
+      const mentioned = new Set(constraints.mentionedAuthors.map((name) => normalizeText(name)));
+      authors = (this.cache.authors || [])
+        .filter((author) => mentioned.has(normalizeText(author?.name || "")))
+        .map((author) => this.normalizeAuthor(author));
+    }
+
+    if (!shouldIncludeAuthors) {
       authors = [];
     }
 
@@ -1220,11 +1233,11 @@ class LLMEngine {
     };
   }
 
-  slimAuthorForIntent(author, mode) {
+  slimAuthorForIntent(author, mode, forceFull = false) {
     if (!author) {
       return author;
     }
-    if (mode === "author" || mode === "publisher") {
+    if (forceFull || mode === "author" || mode === "publisher") {
       return author;
     }
     return {
@@ -1766,8 +1779,12 @@ class LLMEngine {
     const result = `${stripLinks(coreResult)}\n\n${helpfulInfo}`;
 
     const mode = aiDecision.mode || "general";
+    const finalConstraints = this.parseQueryConstraints(prompt, books, authors);
+    const forceFullAuthorPayload = finalConstraints.mentionedAuthors.length > 0 || detectIntent(prompt).asksAuthor;
     const shapedBooks = matchedBooks.map((book) => this.slimBookForIntent(book, mode));
-    const shapedAuthors = matchedAuthors.map((author) => this.slimAuthorForIntent(author, mode));
+    const shapedAuthors = matchedAuthors.map((author) =>
+      this.slimAuthorForIntent(author, mode, forceFullAuthorPayload)
+    );
 
     return {
       result,
