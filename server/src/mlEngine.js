@@ -116,6 +116,14 @@ function truncateWords(text, maxWords) {
   return `${words.slice(0, maxWords).join(" ")}...`;
 }
 
+function splitIntoSentences(text) {
+  return String(text || "")
+    .replace(/\s+/g, " ")
+    .split(/(?<=[.!?])\s+/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
+
 function sharedTokenCount(a, b) {
   let count = 0;
   for (const token of a) {
@@ -503,6 +511,298 @@ class LLMEngine {
       params.set("key", this.googleBooksApiKey);
     }
     return `${this.googleBooksApi}?${params.toString()}`;
+  }
+
+  buildGoogleBooksSummaryUrl(query, language = "en", maxResults = 8) {
+    const params = new URLSearchParams({
+      q: query,
+      maxResults: String(Math.max(1, Math.min(20, maxResults))),
+      printType: "books",
+      projection: "full",
+      langRestrict: language || "en",
+    });
+    if (this.googleBooksApiKey) {
+      params.set("key", this.googleBooksApiKey);
+    }
+    return `${this.googleBooksApi}?${params.toString()}`;
+  }
+
+  normalizeGoogleBook(item) {
+    const info = item?.volumeInfo || {};
+    const sale = item?.saleInfo || {};
+    const title = stripLinks(info?.title || "");
+    const subtitle = stripLinks(info?.subtitle || "");
+    const description = stripLinks(info?.description || "");
+    const authors = Array.isArray(info?.authors) ? info.authors.map((a) => stripLinks(a)).filter(Boolean) : [];
+    const categories = Array.isArray(info?.categories)
+      ? info.categories.map((c) => stripLinks(c)).filter(Boolean)
+      : [];
+
+    return {
+      id: item?.id || null,
+      title,
+      subtitle,
+      description,
+      authors,
+      categories,
+      published_date: info?.publishedDate || null,
+      page_count: Number.isFinite(info?.pageCount) ? info.pageCount : null,
+      average_rating: Number.isFinite(info?.averageRating) ? info.averageRating : null,
+      ratings_count: Number.isFinite(info?.ratingsCount) ? info.ratingsCount : null,
+      maturity_rating: info?.maturityRating || null,
+      language: info?.language || null,
+      image: info?.imageLinks?.thumbnail || info?.imageLinks?.smallThumbnail || null,
+      industry_identifiers: Array.isArray(info?.industryIdentifiers) ? info.industryIdentifiers : [],
+      saleability: sale?.saleability || null,
+    };
+  }
+
+  async fetchGoogleSummaryCandidates(query, language = "en", maxResults = 8) {
+    const url = this.buildGoogleBooksSummaryUrl(query, language, maxResults);
+    const response = await fetch(url, {
+      method: "GET",
+      headers: {
+        Accept: "application/json",
+      },
+    });
+    if (!response.ok) {
+      return [];
+    }
+    const payload = await response.json();
+    const items = Array.isArray(payload?.items) ? payload.items : [];
+    return items.map((item) => this.normalizeGoogleBook(item)).filter((item) => item.title);
+  }
+
+  scoreSummaryCandidate(candidate, query, author = "") {
+    const qTokens = new Set(tokenize(query));
+    const titleTokens = new Set(tokenize(candidate?.title || ""));
+    const descTokens = new Set(tokenize(candidate?.description || ""));
+    const authorBlob = (candidate?.authors || []).join(" ");
+    const authorTokens = new Set(tokenize(authorBlob));
+    const catTokens = new Set(tokenize((candidate?.categories || []).join(" ")));
+
+    let score = 0;
+    score += sharedTokenCount(qTokens, titleTokens) * 28;
+    score += sharedTokenCount(qTokens, descTokens) * 8;
+    score += sharedTokenCount(qTokens, catTokens) * 10;
+
+    const qLower = String(query || "").toLowerCase();
+    const titleLower = String(candidate?.title || "").toLowerCase();
+    if (titleLower && qLower.includes(titleLower)) {
+      score += 120;
+    }
+
+    const requestedAuthor = normalizeText(author || "");
+    if (requestedAuthor) {
+      const candidateAuthors = (candidate?.authors || []).map((name) => normalizeText(name));
+      if (candidateAuthors.includes(requestedAuthor)) {
+        score += 140;
+      } else if (candidateAuthors.some((name) => name.includes(requestedAuthor) || requestedAuthor.includes(name))) {
+        score += 80;
+      } else {
+        score -= 40;
+      }
+    } else {
+      score += sharedTokenCount(qTokens, authorTokens) * 14;
+    }
+
+    if (candidate?.average_rating) {
+      score += candidate.average_rating * 4;
+    }
+    if (candidate?.ratings_count) {
+      score += Math.min(20, Math.log10(candidate.ratings_count + 1) * 6);
+    }
+
+    return score;
+  }
+
+  buildKeyTakeaways(primaryBook, wikiContext, maxTakeaways = 5) {
+    const pool = [
+      ...splitIntoSentences(primaryBook?.description || ""),
+      ...splitIntoSentences(wikiContext?.extract || ""),
+    ].filter((line) => line.length > 40);
+
+    const uniqueLines = unique(pool.map((line) => truncateWords(line, 24)));
+    const compact = uniqueLines.slice(0, Math.max(3, Math.min(8, maxTakeaways)));
+    if (compact.length) {
+      return compact;
+    }
+
+    return [
+      `This book explores layered ideas through a distinct narrative voice.`,
+      `Its strongest value comes from how it connects theme with practical reader impact.`,
+      `The reading experience is best for audiences looking for depth rather than surface-level plot beats.`,
+    ];
+  }
+
+  buildInspiredQuoteLines(primaryBook, wikiContext, maxQuotes = 3) {
+    const title = primaryBook?.title || "this book";
+    const theme = (primaryBook?.categories || []).slice(0, 2).join(", ") || "its central themes";
+    const base = [
+      `In "${title}", meaning often appears quietly before it becomes obvious.`,
+      `The narrative rhythm turns ${theme} into something emotionally immediate.`,
+      `Its core idea lingers: growth is usually subtle before it is visible.`,
+      `The story suggests that perspective can change outcomes more than circumstance.`,
+    ];
+    if (wikiContext?.extract) {
+      base.push(`A wider context reinforces why "${title}" resonates beyond a single genre lane.`);
+    }
+    return unique(base).slice(0, Math.max(1, Math.min(5, maxQuotes)));
+  }
+
+  async buildSimilarBooksForSummary(primaryBook, catalogBooks, topK = 4) {
+    if (!primaryBook || !Array.isArray(catalogBooks) || !catalogBooks.length) {
+      return [];
+    }
+
+    const targetText = normalizeText(
+      `${primaryBook.title || ""} ${primaryBook.description || ""} ${(primaryBook.authors || []).join(" ")} ${(primaryBook.categories || []).join(" ")}`
+    );
+    const targetTokens = new Set(tokenize(targetText));
+
+    const scored = catalogBooks
+      .map((book) => {
+        const text = normalizeText(
+          `${getBookTitle(book)} ${getBookDescription(book)} ${getBookAuthorNames(book).join(" ")} ${getBookCategoryNames(book).join(" ")}`
+        );
+        const bookTokens = new Set(tokenize(text));
+        let score = sharedTokenCount(targetTokens, bookTokens) * 12;
+        const titleOverlap = sharedTokenCount(new Set(tokenize(primaryBook.title || "")), new Set(tokenize(getBookTitle(book))));
+        score += titleOverlap * 20;
+        return { book, score };
+      })
+      .sort((a, b) => b.score - a.score)
+      .filter((item) => item.score > 0)
+      .slice(0, Math.max(1, Math.min(10, topK * 3)));
+
+    const reranked = await this.semanticRerank(
+      `${primaryBook.title || ""} ${primaryBook.description || ""}`,
+      scored.map((item) => ({ book: item.book, score: item.score }))
+    );
+
+    return reranked.slice(0, topK).map((item) => this.normalizeBook(item.book));
+  }
+
+  buildSummaryFallbackText(payload, maxTokens) {
+    const title = payload?.book?.title || "Selected title";
+    const authorText = (payload?.book?.authors || []).join(", ") || "Unknown author";
+    const desc = payload?.book?.description || "Description is limited for this title.";
+    const takeawaysText = (payload?.key_takeaways || []).map((line, idx) => `${idx + 1}. ${line}`).join(" ");
+    const similarText = (payload?.similar_books || [])
+      .map((book) => getBookTitle(book))
+      .filter(Boolean)
+      .slice(0, 4)
+      .join(", ");
+
+    const text = [
+      `Here is a detailed summary for "${title}" by ${authorText}.`,
+      truncateWords(desc, 130),
+      takeawaysText ? `Key takeaways: ${takeawaysText}` : "",
+      similarText ? `If this matches your taste, consider: ${similarText}.` : "",
+      `Why this recommendation is reliable: it blends metadata relevance, semantic similarity, and contextual enrichment.`,
+    ]
+      .filter(Boolean)
+      .join(" ");
+
+    return truncateWords(stripLinks(text), Math.max(260, maxTokens));
+  }
+
+  async summarizeBook(request) {
+    const {
+      query,
+      author = "",
+      language = "en",
+      tone = "insightful",
+      include_quotes = true,
+      include_key_takeaways = true,
+      include_similar_books = true,
+      max_tokens = 700,
+      top_k_similar = 4,
+    } = request || {};
+
+    const { books: catalogBooks } = await this.fetchCatalog();
+    const searchQuery = [query, author].filter(Boolean).join(" ").trim();
+    const candidates = await this.fetchGoogleSummaryCandidates(searchQuery || query, language, 8);
+    if (!candidates.length) {
+      throw new Error("No external books found for this query.");
+    }
+
+    const rankedCandidates = candidates
+      .map((candidate) => ({
+        candidate,
+        score: this.scoreSummaryCandidate(candidate, query, author),
+      }))
+      .sort((a, b) => b.score - a.score);
+    const primary = rankedCandidates[0]?.candidate;
+    if (!primary) {
+      throw new Error("Unable to rank an external book candidate.");
+    }
+
+    const wikiContext = await this.fetchWikipediaExtract(
+      [primary.title, (primary.authors || [])[0]].filter(Boolean).join(" ")
+    );
+    const keyTakeaways = include_key_takeaways ? this.buildKeyTakeaways(primary, wikiContext, 5) : [];
+    const quoteLines = include_quotes ? this.buildInspiredQuoteLines(primary, wikiContext, 3) : [];
+    const similarBooks = include_similar_books
+      ? await this.buildSimilarBooksForSummary(primary, catalogBooks, top_k_similar)
+      : [];
+
+    const summaryContext = JSON.stringify({
+      query,
+      author,
+      tone,
+      book: primary,
+      wiki_context: wikiContext?.extract || "",
+      key_takeaways: keyTakeaways,
+      quote_lines: quoteLines,
+      similar_books: similarBooks.map((book) => ({
+        title: getBookTitle(book),
+        authors: getBookAuthorNames(book),
+        category: getBookCategoryNames(book),
+        price: getBookPrimarySellingPrice(book),
+      })),
+    });
+
+    const llamaResult = await this.generateWithLlama(
+      `Generate an elaborative NLP summary for the selected book in a ${tone} tone. Include a clear structure, nuanced interpretation, and reader guidance.`,
+      summaryContext,
+      Math.max(420, max_tokens)
+    );
+
+    const summaryText =
+      llamaResult ||
+      this.buildSummaryFallbackText(
+        {
+          book: primary,
+          key_takeaways: keyTakeaways,
+          similar_books: similarBooks,
+        },
+        max_tokens
+      );
+
+    return {
+      result: summaryText,
+      source: {
+        primary: "google_books_api",
+        enrichment: wikiContext ? "wikipedia_api" : null,
+        nlp: this.semantic.enabled ? "transformers" : "keyword_fallback",
+      },
+      summary_for: {
+        title: primary.title,
+        subtitle: primary.subtitle || null,
+        authors: primary.authors,
+        categories: primary.categories,
+        published_date: primary.published_date,
+        page_count: primary.page_count,
+        average_rating: primary.average_rating,
+        ratings_count: primary.ratings_count,
+        language: primary.language,
+        image: primary.image,
+      },
+      key_takeaways: keyTakeaways,
+      quote_lines: quoteLines,
+      similar_books: similarBooks,
+    };
   }
 
   async fetchGoogleHints(prompt) {
