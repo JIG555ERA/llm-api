@@ -544,6 +544,7 @@ class LLMEngine {
       subtitle,
       description,
       authors,
+      publisher: stripLinks(info?.publisher || ""),
       categories,
       published_date: info?.publishedDate || null,
       page_count: Number.isFinite(info?.pageCount) ? info.pageCount : null,
@@ -707,10 +708,179 @@ class LLMEngine {
     return truncateWords(stripLinks(text), Math.max(260, maxTokens));
   }
 
+  async detectSummaryEntityType(query, explicitType, catalogAuthors) {
+    const type = String(explicitType || "auto").toLowerCase();
+    if (type !== "auto") {
+      return type;
+    }
+
+    const q = String(query || "");
+    const qNorm = normalizeText(q);
+    if (/\b(publisher|published by|publication|imprint)\b/i.test(q)) {
+      return "publisher";
+    }
+    if (/\b(author|writer|written by|who wrote|books by)\b/i.test(q)) {
+      return "author";
+    }
+
+    const matchedCatalogAuthor = (catalogAuthors || []).some((author) => {
+      const n = normalizeText(author?.name || "");
+      return n && qNorm.includes(n);
+    });
+    if (matchedCatalogAuthor) {
+      return "author";
+    }
+
+    const intent = await this.decideWithTransformers(q);
+    if (intent?.mode === "author") {
+      return "author";
+    }
+    if (intent?.mode === "publisher") {
+      return "publisher";
+    }
+    return "book";
+  }
+
+  pickLikelyAuthorName(query, explicitAuthor, catalogAuthors, candidates) {
+    if (explicitAuthor) {
+      return stripLinks(explicitAuthor);
+    }
+
+    const qNorm = normalizeText(query);
+    const dbMatch = (catalogAuthors || []).find((author) => {
+      const n = normalizeText(author?.name || "");
+      return n && qNorm.includes(n);
+    });
+    if (dbMatch?.name) {
+      return dbMatch.name;
+    }
+
+    const authorCount = new Map();
+    for (const candidate of candidates || []) {
+      for (const name of candidate?.authors || []) {
+        const key = stripLinks(name);
+        if (!key) continue;
+        authorCount.set(key, (authorCount.get(key) || 0) + 1);
+      }
+    }
+    const top = [...authorCount.entries()].sort((a, b) => b[1] - a[1])[0];
+    return top?.[0] || "";
+  }
+
+  pickLikelyPublisherName(query, candidates) {
+    const qNorm = normalizeText(query);
+    const pubCount = new Map();
+    for (const candidate of candidates || []) {
+      const pub = stripLinks(candidate?.publisher || "");
+      if (!pub) continue;
+      const key = normalizeText(pub);
+      const boost = qNorm.includes(key) ? 3 : 1;
+      pubCount.set(pub, (pubCount.get(pub) || 0) + boost);
+    }
+    const top = [...pubCount.entries()].sort((a, b) => b[1] - a[1])[0];
+    return top?.[0] || "";
+  }
+
+  buildAuthorProfileFromCandidates(authorName, candidates) {
+    const target = normalizeText(authorName);
+    const filtered = (candidates || []).filter((book) => {
+      const names = (book?.authors || []).map((n) => normalizeText(n));
+      if (!target) {
+        return names.length > 0;
+      }
+      return names.some((name) => name === target || name.includes(target) || target.includes(name));
+    });
+    const books = filtered.length ? filtered : candidates.slice(0, 5);
+
+    const categories = new Map();
+    const publishers = new Map();
+    for (const book of books) {
+      for (const c of book?.categories || []) {
+        categories.set(c, (categories.get(c) || 0) + 1);
+      }
+      const p = stripLinks(book?.publisher || "");
+      if (p) {
+        publishers.set(p, (publishers.get(p) || 0) + 1);
+      }
+    }
+
+    return {
+      name: authorName || (books[0]?.authors || [])[0] || "Unknown author",
+      books,
+      top_categories: [...categories.entries()].sort((a, b) => b[1] - a[1]).slice(0, 4).map(([name]) => name),
+      top_publishers: [...publishers.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3).map(([name]) => name),
+    };
+  }
+
+  buildPublisherProfileFromCandidates(publisherName, candidates) {
+    const target = normalizeText(publisherName);
+    const filtered = (candidates || []).filter((book) => {
+      const p = normalizeText(book?.publisher || "");
+      if (!target) {
+        return !!p;
+      }
+      return p === target || p.includes(target) || target.includes(p);
+    });
+    const books = filtered.length ? filtered : candidates.slice(0, 5);
+
+    const categories = new Map();
+    const authors = new Map();
+    for (const book of books) {
+      for (const c of book?.categories || []) {
+        categories.set(c, (categories.get(c) || 0) + 1);
+      }
+      for (const a of book?.authors || []) {
+        authors.set(a, (authors.get(a) || 0) + 1);
+      }
+    }
+
+    return {
+      name: publisherName || books[0]?.publisher || "Unknown publisher",
+      books,
+      top_categories: [...categories.entries()].sort((a, b) => b[1] - a[1]).slice(0, 4).map(([name]) => name),
+      top_authors: [...authors.entries()].sort((a, b) => b[1] - a[1]).slice(0, 4).map(([name]) => name),
+    };
+  }
+
+  buildAuthorSummaryFallbackText(profile, wikiContext, maxTokens) {
+    const titles = (profile?.books || []).slice(0, 5).map((b) => b.title).filter(Boolean).join(", ");
+    const categories = (profile?.top_categories || []).join(", ") || "not enough category data";
+    const publishers = (profile?.top_publishers || []).join(", ") || "publisher data is sparse";
+    const text = [
+      `Author profile summary: ${profile?.name || "Unknown author"}.`,
+      wikiContext?.extract ? `Context: ${truncateWords(wikiContext.extract, 60)}` : "",
+      titles ? `Known books from retrieved sources include: ${titles}.` : "",
+      `Common category signals: ${categories}.`,
+      `Frequent publishing links: ${publishers}.`,
+      `This profile is generated by combining metadata, semantic matching, and intent analysis.`,
+    ]
+      .filter(Boolean)
+      .join(" ");
+    return truncateWords(stripLinks(text), Math.max(260, maxTokens));
+  }
+
+  buildPublisherSummaryFallbackText(profile, wikiContext, maxTokens) {
+    const titles = (profile?.books || []).slice(0, 5).map((b) => b.title).filter(Boolean).join(", ");
+    const categories = (profile?.top_categories || []).join(", ") || "not enough category data";
+    const authors = (profile?.top_authors || []).join(", ") || "author distribution is sparse";
+    const text = [
+      `Publisher profile summary: ${profile?.name || "Unknown publisher"}.`,
+      wikiContext?.extract ? `Context: ${truncateWords(wikiContext.extract, 60)}` : "",
+      titles ? `Representative titles include: ${titles}.` : "",
+      `Dominant categories: ${categories}.`,
+      `Frequent associated authors: ${authors}.`,
+      `This summary is grounded in external catalog metadata and semantic ranking.`,
+    ]
+      .filter(Boolean)
+      .join(" ");
+    return truncateWords(stripLinks(text), Math.max(260, maxTokens));
+  }
+
   async summarizeBook(request) {
     const {
       query,
       author = "",
+      entity_type = "auto",
       language = "en",
       tone = "insightful",
       include_quotes = true,
@@ -720,11 +890,145 @@ class LLMEngine {
       top_k_similar = 4,
     } = request || {};
 
-    const { books: catalogBooks } = await this.fetchCatalog();
+    const { books: catalogBooks, authors: catalogAuthors } = await this.fetchCatalog();
     const searchQuery = [query, author].filter(Boolean).join(" ").trim();
     const candidates = await this.fetchGoogleSummaryCandidates(searchQuery || query, language, 8);
     if (!candidates.length) {
       throw new Error("No external books found for this query.");
+    }
+    const detectedEntityType = await this.detectSummaryEntityType(query, entity_type, catalogAuthors);
+
+    if (detectedEntityType === "author") {
+      const authorName = this.pickLikelyAuthorName(query, author, catalogAuthors, candidates);
+      const profile = this.buildAuthorProfileFromCandidates(authorName, candidates);
+      const wikiContext = await this.fetchWikipediaExtract(`${profile.name} author`);
+      const keyTakeaways = include_key_takeaways
+        ? [
+            `Top author focus: ${profile.name}.`,
+            `Most visible categories: ${(profile.top_categories || []).join(", ") || "not enough signals"}.`,
+            `Frequent publisher links: ${(profile.top_publishers || []).join(", ") || "not enough signals"}.`,
+          ]
+        : [];
+      const quoteLines = include_quotes
+        ? [
+            `${profile.name}'s writing footprint is best understood through recurring themes, not isolated titles.`,
+            `A strong author signal appears when category consistency and reader intent align.`,
+          ]
+        : [];
+      const seed = {
+        title: profile.name,
+        description: `Author profile for ${profile.name}`,
+        authors: [profile.name],
+        categories: profile.top_categories || [],
+      };
+      const similarBooks = include_similar_books
+        ? await this.buildSimilarBooksForSummary(seed, catalogBooks, top_k_similar)
+        : [];
+
+      const summaryContext = JSON.stringify({
+        entity_type: "author",
+        query,
+        tone,
+        author_profile: profile,
+        wiki_context: wikiContext?.extract || "",
+        key_takeaways: keyTakeaways,
+        quote_lines: quoteLines,
+      });
+      const llamaResult = await this.generateWithLlama(
+        `Generate an NLP-rich, elaborative author profile summary in a ${tone} tone with practical reader guidance.`,
+        summaryContext,
+        Math.max(420, max_tokens)
+      );
+      const result = llamaResult || this.buildAuthorSummaryFallbackText(profile, wikiContext, max_tokens);
+
+      const matchedAuthors = (catalogAuthors || [])
+        .filter((a) => normalizeText(a?.name || "") === normalizeText(profile.name))
+        .map((a) => this.normalizeAuthor(a));
+
+      return {
+        result,
+        intent: { entity_type: "author", detected_from: entity_type === "auto" ? "auto" : "explicit" },
+        source: {
+          primary: "google_books_api",
+          enrichment: wikiContext ? "wikipedia_api" : null,
+          nlp: this.semantic.enabled ? "transformers" : "keyword_fallback",
+        },
+        summary_for: {
+          type: "author",
+          name: profile.name,
+          top_categories: profile.top_categories,
+          top_publishers: profile.top_publishers,
+          known_titles: profile.books.slice(0, 6).map((b) => b.title).filter(Boolean),
+        },
+        key_takeaways: keyTakeaways,
+        quote_lines: quoteLines,
+        similar_books: similarBooks,
+        matched_authors: matchedAuthors,
+      };
+    }
+
+    if (detectedEntityType === "publisher") {
+      const publisherName = this.pickLikelyPublisherName(query, candidates);
+      const profile = this.buildPublisherProfileFromCandidates(publisherName, candidates);
+      const wikiContext = await this.fetchWikipediaExtract(`${profile.name} publisher`);
+      const keyTakeaways = include_key_takeaways
+        ? [
+            `Publisher focus: ${profile.name}.`,
+            `Category concentration: ${(profile.top_categories || []).join(", ") || "not enough signals"}.`,
+            `Frequent author associations: ${(profile.top_authors || []).join(", ") || "not enough signals"}.`,
+          ]
+        : [];
+      const quoteLines = include_quotes
+        ? [
+            `${profile.name} stands out through portfolio shape, not just a single bestseller.`,
+            `Publisher identity usually appears in recurring category and author patterns.`,
+          ]
+        : [];
+      const seed = {
+        title: profile.name,
+        description: `Publisher profile for ${profile.name}`,
+        authors: profile.top_authors || [],
+        categories: profile.top_categories || [],
+      };
+      const similarBooks = include_similar_books
+        ? await this.buildSimilarBooksForSummary(seed, catalogBooks, top_k_similar)
+        : [];
+
+      const summaryContext = JSON.stringify({
+        entity_type: "publisher",
+        query,
+        tone,
+        publisher_profile: profile,
+        wiki_context: wikiContext?.extract || "",
+        key_takeaways: keyTakeaways,
+        quote_lines: quoteLines,
+      });
+      const llamaResult = await this.generateWithLlama(
+        `Generate an NLP-rich, elaborative publisher profile summary in a ${tone} tone with market and catalog insights.`,
+        summaryContext,
+        Math.max(420, max_tokens)
+      );
+      const result = llamaResult || this.buildPublisherSummaryFallbackText(profile, wikiContext, max_tokens);
+
+      return {
+        result,
+        intent: { entity_type: "publisher", detected_from: entity_type === "auto" ? "auto" : "explicit" },
+        source: {
+          primary: "google_books_api",
+          enrichment: wikiContext ? "wikipedia_api" : null,
+          nlp: this.semantic.enabled ? "transformers" : "keyword_fallback",
+        },
+        summary_for: {
+          type: "publisher",
+          name: profile.name,
+          top_categories: profile.top_categories,
+          top_authors: profile.top_authors,
+          representative_titles: profile.books.slice(0, 6).map((b) => b.title).filter(Boolean),
+        },
+        key_takeaways: keyTakeaways,
+        quote_lines: quoteLines,
+        similar_books: similarBooks,
+      };
     }
 
     const rankedCandidates = candidates
@@ -782,15 +1086,18 @@ class LLMEngine {
 
     return {
       result: summaryText,
+      intent: { entity_type: "book", detected_from: entity_type === "auto" ? "auto" : "explicit" },
       source: {
         primary: "google_books_api",
         enrichment: wikiContext ? "wikipedia_api" : null,
         nlp: this.semantic.enabled ? "transformers" : "keyword_fallback",
       },
       summary_for: {
+        type: "book",
         title: primary.title,
         subtitle: primary.subtitle || null,
         authors: primary.authors,
+        publisher: primary.publisher || null,
         categories: primary.categories,
         published_date: primary.published_date,
         page_count: primary.page_count,

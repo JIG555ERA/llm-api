@@ -36,6 +36,10 @@ function validateBookSummaryRequest(body) {
   }
 
   const author = typeof body?.author === "string" ? body.author.trim() : "";
+  const entityType = typeof body?.entity_type === "string" ? body.entity_type.trim().toLowerCase() : "auto";
+  if (!["auto", "book", "author", "publisher"].includes(entityType)) {
+    errors.push("entity_type must be one of: auto, book, author, publisher.");
+  }
   const language = typeof body?.language === "string" ? body.language.trim() : "en";
   const tone = typeof body?.tone === "string" ? body.tone.trim() : "insightful";
 
@@ -75,6 +79,7 @@ function validateBookSummaryRequest(body) {
     value: {
       query,
       author,
+      entity_type: entityType,
       language: language || "en",
       tone: tone || "insightful",
       include_quotes: includeQuotes,
