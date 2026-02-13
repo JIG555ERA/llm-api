@@ -19,10 +19,12 @@ app.get("/", (req, res) => {
 });
 
 app.post("/generate", async (req, res) => {
+  const requestTimestamp = new Date().toISOString();
   const { isValid, errors, value } = validateGenerationRequest(req.body);
   if (!isValid) {
     return res.status(422).json({
       detail: errors,
+      request_timestamp: requestTimestamp,
     });
   }
 
@@ -34,6 +36,7 @@ app.post("/generate", async (req, res) => {
     );
 
     const response = {
+      request_timestamp: requestTimestamp,
       result: generation.result,
       token_usage: generation.result.split(/\s+/).filter(Boolean).length,
       matched_books: generation.matched_books,
@@ -51,6 +54,7 @@ app.post("/generate", async (req, res) => {
   } catch (error) {
     return res.status(500).json({
       detail: error.message,
+      request_timestamp: requestTimestamp,
     });
   }
 });
