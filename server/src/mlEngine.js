@@ -303,6 +303,115 @@ function getBookCategoryNames(book) {
     .filter(Boolean);
 }
 
+function getBookGenreNames(book) {
+  if (!Array.isArray(book?.genres)) {
+    return [];
+  }
+  return book.genres
+    .map((genre) => String(genre?.name || genre || "").trim())
+    .filter(Boolean);
+}
+
+function getBookIsbn(book) {
+  return String(book?.isbn || "").trim();
+}
+
+function getBookSku(book) {
+  return String(book?.sku || "").trim();
+}
+
+function getBookPrimaryImage(book) {
+  if (Array.isArray(book?.images) && book.images.length) {
+    const primary = book.images.find((img) => img?.is_primary && img?.url) || book.images.find((img) => img?.url);
+    if (primary?.url) {
+      return String(primary.url).trim();
+    }
+  }
+  if (Array.isArray(book?.image) && book.image[0]) {
+    return String(book.image[0]).trim();
+  }
+  if (typeof book?.image === "string" && book.image.trim()) {
+    return book.image.trim();
+  }
+  return "";
+}
+
+function normalizeFieldAlias(rawField) {
+  const key = normalizeText(rawField);
+  if (!key || key === "all" || key === "any") {
+    return "all";
+  }
+  if (/(^book title$|^title$|^name$)/.test(key)) {
+    return "title";
+  }
+  if (/(^author$|^authors$|^writer$|^pen name$)/.test(key)) {
+    return "author";
+  }
+  if (/(^category$|^categories$|^subject$)/.test(key)) {
+    return "category";
+  }
+  if (/(^genre$|^genres$|^theme$)/.test(key)) {
+    return "genre";
+  }
+  if (/(^isbn$|^isbn 10$|^isbn 13$)/.test(key)) {
+    return "isbn";
+  }
+  if (/(^sku$|^code$)/.test(key)) {
+    return "sku";
+  }
+  if (/(^description$|^summary$|^about$)/.test(key)) {
+    return "description";
+  }
+  if (/(^language$|^lang$)/.test(key)) {
+    return "language";
+  }
+  return "all";
+}
+
+function parseStringSearchOperator(promptText) {
+  const text = String(promptText || "").trim();
+  const emptyResult = {
+    operator: "contains",
+    field: "all",
+    value: "",
+    residual_query: text,
+  };
+  if (!text) {
+    return emptyResult;
+  }
+
+  const patterns = [
+    {
+      operator: "starts_with",
+      regex:
+        /\b(?:(book\s+title|title|author|category|genre|isbn|sku|description|language)\s+)?(?:starts?\s+with|starting\s+with|begins?\s+with|beginning\s+with|prefix(?:ed)?\s+with)\s+["']?([^"']+?)["']?(?=\s+(?:and|with|under|over|below|above|price|category|genre|author|isbn|sku|language)\b|$)/i,
+    },
+    {
+      operator: "ends_with",
+      regex:
+        /\b(?:(book\s+title|title|author|category|genre|isbn|sku|description|language)\s+)?(?:ends?\s+with|ending\s+with|suffix(?:ed)?\s+with)\s+["']?([^"']+?)["']?(?=\s+(?:and|with|under|over|below|above|price|category|genre|author|isbn|sku|language)\b|$)/i,
+    },
+  ];
+
+  for (const pattern of patterns) {
+    const match = text.match(pattern.regex);
+    if (!match) {
+      continue;
+    }
+    const rawField = String(match[1] || "").trim();
+    const value = String(match[2] || "").trim();
+    const residual = text.replace(match[0], " ").replace(/\s+/g, " ").trim();
+    return {
+      operator: pattern.operator,
+      field: normalizeFieldAlias(rawField),
+      value,
+      residual_query: residual,
+    };
+  }
+
+  return emptyResult;
+}
+
 function buildQueryChunks(prompt) {
   const words = tokenize(prompt);
   const chunks = [];
@@ -351,6 +460,8 @@ class LLMEngine {
   constructor() {
     this.modelId = MODEL_ID;
     this.booksApiUrl = process.env.BOOKS_API_URL || DEFAULT_BOOKS_API_URL;
+    this.bookDetailsApiBase =
+      process.env.BOOK_DETAILS_API_BASE || this.booksApiUrl.replace(/\/all(?:\?.*)?$/i, "");
     this.authorsApiUrl = process.env.AUTHORS_API_URL || DEFAULT_AUTHORS_API_URL;
     this.googleBooksApi = process.env.GOOGLE_BOOKS_API_BASE || DEFAULT_GOOGLE_BOOKS_API;
     this.googleBooksApiKey = process.env.GOOGLE_BOOKS_API_KEY || "";
@@ -363,6 +474,7 @@ class LLMEngine {
       authors: [],
       updatedAt: 0,
     };
+    this.bookDetailsCache = new Map();
     this.semantic = {
       enabled: true,
       extractor: null,
@@ -375,6 +487,7 @@ class LLMEngine {
   async loadModel() {
     console.log(`Engine configured: ${this.modelId}`);
     console.log(`Books source: ${this.booksApiUrl}`);
+    console.log(`Book details source: ${this.bookDetailsApiBase}`);
     console.log(`Authors source: ${this.authorsApiUrl}`);
     console.log(`Google Books source: ${this.googleBooksApi}`);
     console.log(`OpenLibrary source: ${this.openLibraryApi}`);
@@ -1296,6 +1409,404 @@ class LLMEngine {
     };
 
     return { books, authors };
+  }
+
+  buildBookDetailsUrl(bookId) {
+    const id = Number(bookId);
+    if (!Number.isFinite(id) || id <= 0) {
+      return "";
+    }
+    return `${this.bookDetailsApiBase.replace(/\/+$/, "")}/${id}`;
+  }
+
+  async fetchBookDetailById(bookId) {
+    const key = String(bookId || "");
+    if (!key) {
+      return null;
+    }
+    if (this.bookDetailsCache.has(key)) {
+      return this.bookDetailsCache.get(key);
+    }
+    const url = this.buildBookDetailsUrl(bookId);
+    if (!url) {
+      this.bookDetailsCache.set(key, null);
+      return null;
+    }
+    try {
+      const payload = await this.fetchJSON(url);
+      const detail = payload?.data || null;
+      this.bookDetailsCache.set(key, detail);
+      return detail;
+    } catch (error) {
+      this.bookDetailsCache.set(key, null);
+      return null;
+    }
+  }
+
+  mergeBookWithDetail(book, detail) {
+    if (!detail) {
+      return this.normalizeBook(book);
+    }
+
+    const merged = {
+      ...book,
+      ...detail,
+    };
+
+    merged.authors = Array.isArray(detail?.authors) && detail.authors.length
+      ? detail.authors
+      : Array.isArray(book?.authors)
+        ? book.authors
+        : [];
+    merged.categories = Array.isArray(detail?.categories) && detail.categories.length
+      ? detail.categories
+      : Array.isArray(book?.categories)
+        ? book.categories
+        : [];
+    merged.price = Array.isArray(detail?.price) && detail.price.length
+      ? detail.price
+      : Array.isArray(book?.price)
+        ? book.price
+        : [];
+    merged.genres = Array.isArray(detail?.genres) ? detail.genres : Array.isArray(book?.genres) ? book.genres : [];
+
+    const primaryImage = getBookPrimaryImage(merged);
+    if (primaryImage) {
+      merged.image = [primaryImage];
+    }
+
+    return this.normalizeBook(merged);
+  }
+
+  async hydrateCatalogWithDetails(books, query = "") {
+    const shouldHydrateAll = true;
+    if (!shouldHydrateAll) {
+      return books.map((book) => this.normalizeBook(book));
+    }
+
+    const detailed = await Promise.all(
+      books.map(async (book) => {
+        const detail = await this.fetchBookDetailById(book?.id);
+        return this.mergeBookWithDetail(book, detail);
+      })
+    );
+    return detailed;
+  }
+
+  getSearchFieldMap(book) {
+    const authors = Array.isArray(book?.authors)
+      ? book.authors.flatMap((author) => [
+          String(author?.name || author || "").trim(),
+          String(author?.pen_name || "").trim(),
+        ]).filter(Boolean)
+      : [];
+    const categories = getBookCategoryNames(book);
+    const genres = getBookGenreNames(book);
+    const isbn = getBookIsbn(book);
+    const sku = getBookSku(book);
+    const distributors = Array.isArray(book?.distributors)
+      ? book.distributors.map((item) => String(item?.name || "").trim()).filter(Boolean)
+      : [];
+    const language = String(book?.language || "").trim();
+    const format = String(book?.format || "").trim();
+    const editionType = String(book?.edition_type || "").trim();
+    const publishedAt = String(book?.published_at || "").trim();
+
+    return {
+      title: [getBookTitle(book)],
+      description: [getBookDescription(book)],
+      author: authors,
+      category: categories,
+      genre: genres,
+      isbn: isbn ? [isbn] : [],
+      sku: sku ? [sku] : [],
+      language: language ? [language] : [],
+      format: format ? [format] : [],
+      edition: editionType ? [editionType] : [],
+      distributor: distributors,
+      published: publishedAt ? [publishedAt] : [],
+      all: [
+        getBookTitle(book),
+        getBookDescription(book),
+        ...authors,
+        ...categories,
+        ...genres,
+        isbn,
+        sku,
+        language,
+        format,
+        editionType,
+        ...distributors,
+        publishedAt,
+      ].filter(Boolean),
+    };
+  }
+
+  getSearchFieldValues(fieldMap, field) {
+    if (field === "all") {
+      return fieldMap.all || [];
+    }
+    return fieldMap[field] || [];
+  }
+
+  doesValueMatchOperator(value, operator, probe) {
+    const left = normalizeText(value);
+    const right = normalizeText(probe);
+    if (!left || !right) {
+      return false;
+    }
+    if (operator === "starts_with") {
+      return left.startsWith(right);
+    }
+    if (operator === "ends_with") {
+      return left.endsWith(right);
+    }
+    if (operator === "exact") {
+      return left === right;
+    }
+    return left.includes(right);
+  }
+
+  scoreBookForSearch(book, query, googleHints, operators, promptTokens) {
+    const fieldMap = this.getSearchFieldMap(book);
+    const queryNorm = normalizeText(query);
+    const titleNorm = normalizeText(getBookTitle(book));
+    const descriptionNorm = normalizeText(getBookDescription(book));
+    const allText = normalizeText((fieldMap.all || []).join(" "));
+
+    let score = 0;
+    const matchedFields = new Set();
+    let hardPass = true;
+
+    if (queryNorm && titleNorm && titleNorm.includes(queryNorm)) {
+      score += 140;
+      matchedFields.add("title");
+    }
+    if (queryNorm && allText.includes(queryNorm)) {
+      score += 90;
+      matchedFields.add("all");
+    }
+
+    for (const token of promptTokens) {
+      if (!token) continue;
+      if (titleNorm.includes(token)) {
+        score += 28;
+        matchedFields.add("title");
+      }
+      if ((fieldMap.author || []).some((name) => normalizeText(name).includes(token))) {
+        score += 24;
+        matchedFields.add("author");
+      }
+      if ((fieldMap.category || []).some((name) => normalizeText(name).includes(token))) {
+        score += 18;
+        matchedFields.add("category");
+      }
+      if ((fieldMap.genre || []).some((name) => normalizeText(name).includes(token))) {
+        score += 18;
+        matchedFields.add("genre");
+      }
+      if ((fieldMap.isbn || []).some((value) => normalizeText(value).includes(token))) {
+        score += 36;
+        matchedFields.add("isbn");
+      }
+      if ((fieldMap.sku || []).some((value) => normalizeText(value).includes(token))) {
+        score += 30;
+        matchedFields.add("sku");
+      }
+      if (descriptionNorm.includes(token)) {
+        score += 8;
+        matchedFields.add("description");
+      }
+    }
+
+    if (operators?.value) {
+      const values = this.getSearchFieldValues(fieldMap, operators.field);
+      const opMatch = values.some((value) =>
+        this.doesValueMatchOperator(value, operators.operator, operators.value)
+      );
+      if (opMatch) {
+        score += 170;
+        matchedFields.add(`op_${operators.field}`);
+      } else {
+        hardPass = false;
+        score -= 260;
+      }
+    }
+
+    const isbnOnlyProbe = queryNorm.replace(/\s+/g, "");
+    if (/^\d{10,13}[0-9x]?$/.test(isbnOnlyProbe)) {
+      const isbnMatches = (fieldMap.isbn || []).some((value) =>
+        normalizeText(value).replace(/\s+/g, "").includes(isbnOnlyProbe)
+      );
+      if (isbnMatches) {
+        score += 220;
+        matchedFields.add("isbn");
+      } else {
+        hardPass = false;
+        score -= 320;
+      }
+    }
+
+    if (googleHints) {
+      const localTitleTokens = new Set(tokenize(titleNorm));
+      for (const remoteTitleTokens of googleHints.titleTokenSets || []) {
+        score += sharedTokenCount(localTitleTokens, remoteTitleTokens) * 6;
+      }
+
+      const localAuthors = new Set((fieldMap.author || []).map((name) => normalizeText(name)));
+      for (const author of localAuthors) {
+        if (googleHints.authors?.has(author)) {
+          score += 30;
+          matchedFields.add("author");
+        }
+      }
+
+      const localGenres = new Set([...(fieldMap.category || []), ...(fieldMap.genre || [])].map((name) => normalizeText(name)));
+      for (const localGenre of localGenres) {
+        for (const remoteCategory of googleHints.categories || []) {
+          const overlap = sharedTokenCount(new Set(tokenize(localGenre)), new Set(tokenize(remoteCategory)));
+          score += overlap * 5;
+          if (overlap > 0) {
+            matchedFields.add("genre");
+          }
+        }
+      }
+    }
+
+    return {
+      score,
+      hardPass,
+      matched_fields: [...matchedFields],
+    };
+  }
+
+  computeMissingFields(book) {
+    const missing = [];
+    if (!getBookIsbn(book)) missing.push("isbn");
+    if (!getBookSku(book)) missing.push("sku");
+    if (!getBookDescription(book)) missing.push("description");
+    if (!Array.isArray(book?.authors) || !book.authors.length) missing.push("authors");
+    if (!Array.isArray(book?.categories) || !book.categories.length) missing.push("categories");
+    if (!Array.isArray(book?.genres) || !book.genres.length) missing.push("genres");
+    if (!Array.isArray(book?.price) || !book.price.length) missing.push("price");
+    if (!String(book?.published_at || "").trim()) missing.push("published_at");
+    if (!String(book?.format || "").trim()) missing.push("format");
+    if (!String(book?.num_of_pages || "").trim() || String(book?.num_of_pages || "").trim() === "0") missing.push("num_of_pages");
+    if (!getBookPrimaryImage(book)) missing.push("image");
+    return missing;
+  }
+
+  pickGoogleIsbn(identifiers) {
+    if (!Array.isArray(identifiers)) {
+      return "";
+    }
+    const preferred = identifiers.find((item) => item?.type === "ISBN_13") || identifiers.find((item) => item?.type === "ISBN_10") || identifiers[0];
+    return String(preferred?.identifier || "").trim();
+  }
+
+  async findGoogleCandidateForBook(book) {
+    const isbn = getBookIsbn(book);
+    const title = getBookTitle(book);
+    const author = getBookAuthorNames(book)[0] || "";
+    const queries = [];
+    if (isbn) {
+      queries.push(`isbn:${isbn}`);
+    }
+    if (title) {
+      const authorPart = author ? ` inauthor:${author}` : "";
+      queries.push(`intitle:${title}${authorPart}`);
+    }
+
+    for (const query of queries) {
+      const candidates = await this.fetchGoogleSummaryCandidates(query, "en", 5);
+      if (!candidates.length) {
+        continue;
+      }
+      const ranked = candidates
+        .map((candidate) => ({
+          candidate,
+          score: this.scoreSummaryCandidate(candidate, `${title} ${author}`.trim(), author),
+        }))
+        .sort((a, b) => b.score - a.score);
+      if (ranked[0]?.candidate) {
+        return ranked[0].candidate;
+      }
+    }
+
+    return null;
+  }
+
+  enrichBookWithGoogle(book, googleCandidate) {
+    if (!googleCandidate) {
+      return {
+        book,
+        enrichment: {
+          source: "google_books_api",
+          google_book_id: null,
+          filled_fields: [],
+        },
+      };
+    }
+
+    const merged = JSON.parse(JSON.stringify(book || {}));
+    const filledFields = [];
+
+    if (!getBookIsbn(merged)) {
+      const googleIsbn = this.pickGoogleIsbn(googleCandidate.industry_identifiers);
+      if (googleIsbn) {
+        merged.isbn = googleIsbn;
+        filledFields.push("isbn");
+      }
+    }
+
+    if ((!Array.isArray(merged.authors) || !merged.authors.length) && Array.isArray(googleCandidate.authors) && googleCandidate.authors.length) {
+      merged.authors = googleCandidate.authors.map((name) => ({ name }));
+      filledFields.push("authors");
+    }
+
+    if ((!Array.isArray(merged.categories) || !merged.categories.length) && Array.isArray(googleCandidate.categories) && googleCandidate.categories.length) {
+      merged.categories = googleCandidate.categories.map((name) => ({ id: null, name }));
+      filledFields.push("categories");
+    }
+
+    if ((!Array.isArray(merged.genres) || !merged.genres.length) && Array.isArray(googleCandidate.categories) && googleCandidate.categories.length) {
+      merged.genres = googleCandidate.categories.map((name) => ({ id: null, name }));
+      filledFields.push("genres");
+    }
+
+    if (!getBookDescription(merged) && googleCandidate.description) {
+      merged.description = googleCandidate.description;
+      filledFields.push("description");
+    }
+
+    if (!String(merged?.language || "").trim() && googleCandidate.language) {
+      merged.language = googleCandidate.language;
+      filledFields.push("language");
+    }
+
+    if (!String(merged?.published_at || "").trim() && googleCandidate.published_date) {
+      merged.published_at = googleCandidate.published_date;
+      filledFields.push("published_at");
+    }
+
+    if ((!String(merged?.num_of_pages || "").trim() || String(merged?.num_of_pages || "").trim() === "0") && googleCandidate.page_count) {
+      merged.num_of_pages = String(googleCandidate.page_count);
+      filledFields.push("num_of_pages");
+    }
+
+    if (!getBookPrimaryImage(merged) && googleCandidate.image) {
+      merged.image = [googleCandidate.image];
+      filledFields.push("image");
+    }
+
+    return {
+      book: this.normalizeBook(merged),
+      enrichment: {
+        source: "google_books_api",
+        google_book_id: googleCandidate.id || null,
+        filled_fields: filledFields,
+      },
+    };
   }
 
   normalizeBook(book) {
@@ -2309,6 +2820,130 @@ class LLMEngine {
 
     infoLines.push(`- Catalog snapshot: ${truncateWords(catalogInsights, 20)}`);
     return infoLines.join("\n");
+  }
+
+  async searchBooks(request = {}) {
+    const {
+      query = "",
+      page = 1,
+      per_page = 20,
+      include_google_enrichment = true,
+      include_book_details = true,
+      enrich_top_n = 10,
+    } = request;
+
+    const { books, authors } = await this.fetchCatalog();
+    if (!books.length) {
+      throw new Error("No books found in the database API response.");
+    }
+
+    const operatorInfo = parseStringSearchOperator(query);
+    const effectiveQuery = String(operatorInfo.residual_query || "").trim();
+    const baseQuery = effectiveQuery || operatorInfo.value || String(query || "");
+    const promptTokens = tokenize(baseQuery);
+
+    let searchableBooks = books.map((book) => this.normalizeBook(book));
+    if (include_book_details) {
+      searchableBooks = await this.hydrateCatalogWithDetails(searchableBooks, query);
+    }
+
+    const googleHints = await this.fetchExternalHints(baseQuery);
+    const constraints = this.parseQueryConstraints(baseQuery, searchableBooks, authors || []);
+
+    const scored = searchableBooks
+      .map((book) => {
+        const searchScore = this.scoreBookForSearch(
+          book,
+          baseQuery,
+          googleHints,
+          operatorInfo,
+          promptTokens
+        );
+        const constraintEval = this.evaluateBookAgainstConstraints(book, constraints);
+        const score =
+          searchScore.score +
+          constraintEval.matchedFieldCount * 24 +
+          constraintEval.chunkCoverage * 80 +
+          (constraintEval.hardPass ? 0 : -180);
+
+        return {
+          book,
+          score,
+          hardPass: searchScore.hardPass && constraintEval.hardPass,
+          matched_fields: unique([...searchScore.matched_fields]),
+        };
+      })
+      .sort((a, b) => b.score - a.score);
+
+    const passed = scored.filter((item) => item.hardPass);
+    const ranked = (passed.length ? passed : scored).filter((item) => item.score > -300);
+    const total = ranked.length;
+    const safePerPage = Math.max(1, Math.min(50, Number(per_page) || 20));
+    const safePage = Math.max(1, Number(page) || 1);
+    const lastPage = Math.max(1, Math.ceil(total / safePerPage));
+    const currentPage = Math.min(safePage, lastPage);
+    const startIndex = (currentPage - 1) * safePerPage;
+    const pageItems = ranked.slice(startIndex, startIndex + safePerPage);
+
+    const enriched = await Promise.all(
+      pageItems.map(async (item, index) => {
+        let selected = item.book;
+        let enrichment = {
+          source: "google_books_api",
+          google_book_id: null,
+          filled_fields: [],
+        };
+
+        if (include_google_enrichment && index < enrich_top_n) {
+          const missingBefore = this.computeMissingFields(selected);
+          if (missingBefore.length) {
+            const googleCandidate = await this.findGoogleCandidateForBook(selected);
+            const enrichedData = this.enrichBookWithGoogle(selected, googleCandidate);
+            selected = enrichedData.book;
+            enrichment = enrichedData.enrichment;
+          }
+        }
+
+        return {
+          ...selected,
+          search_meta: {
+            score: Number(item.score.toFixed(2)),
+            matched_fields: item.matched_fields,
+          },
+          enrichment,
+        };
+      })
+    );
+
+    const from = total === 0 ? 0 : startIndex + 1;
+    const to = Math.min(startIndex + safePerPage, total);
+
+    return {
+      status: "success",
+      query: {
+        raw: String(query || ""),
+        normalized: normalizeText(baseQuery),
+        operator: {
+          type: operatorInfo.operator,
+          field: operatorInfo.field,
+          value: operatorInfo.value || null,
+        },
+      },
+      data: enriched,
+      pagination: {
+        current_page: currentPage,
+        per_page: safePerPage,
+        total,
+        last_page: lastPage,
+        from,
+        to,
+        has_more_pages: currentPage < lastPage,
+      },
+      source: {
+        catalog: include_book_details ? "books_all+book_detail" : "books_all",
+        enrichment: include_google_enrichment ? "google_books_api" : null,
+      },
+    };
   }
 
   async generate(prompt, maxNewTokens = 256) {

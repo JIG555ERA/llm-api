@@ -3,7 +3,11 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const { llmEngine, MODEL_ID } = require("./mlEngine");
-const { validateGenerationRequest, validateBookSummaryRequest } = require("./validation");
+const {
+  validateGenerationRequest,
+  validateBookSummaryRequest,
+  validateBookSearchRequest,
+} = require("./validation");
 
 const app = express();
 
@@ -74,6 +78,30 @@ app.post("/book-summary", async (req, res) => {
     return res.json({
       request_timestamp: requestTimestamp,
       ...summary,
+    });
+  } catch (error) {
+    return res.status(500).json({
+      detail: error.message,
+      request_timestamp: requestTimestamp,
+    });
+  }
+});
+
+app.post("/books/search", async (req, res) => {
+  const requestTimestamp = new Date().toISOString();
+  const { isValid, errors, value } = validateBookSearchRequest(req.body);
+  if (!isValid) {
+    return res.status(422).json({
+      detail: errors,
+      request_timestamp: requestTimestamp,
+    });
+  }
+
+  try {
+    const result = await llmEngine.searchBooks(value);
+    return res.json({
+      request_timestamp: requestTimestamp,
+      ...result,
     });
   } catch (error) {
     return res.status(500).json({

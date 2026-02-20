@@ -92,7 +92,55 @@ function validateBookSummaryRequest(body) {
   };
 }
 
+function validateBookSearchRequest(body) {
+  const errors = [];
+
+  const query = typeof body?.query === "string" ? body.query.trim() : "";
+  if (!query) {
+    errors.push("query is required and must be a non-empty string.");
+  }
+
+  const page = body?.page ?? 1;
+  if (!Number.isInteger(page) || page < 1) {
+    errors.push("page must be an integer greater than or equal to 1.");
+  }
+
+  const perPage = body?.per_page ?? 20;
+  if (!Number.isInteger(perPage) || perPage < 1 || perPage > 50) {
+    errors.push("per_page must be an integer between 1 and 50.");
+  }
+
+  const includeGoogleEnrichment = body?.include_google_enrichment ?? true;
+  if (typeof includeGoogleEnrichment !== "boolean") {
+    errors.push("include_google_enrichment must be a boolean.");
+  }
+
+  const includeBookDetails = body?.include_book_details ?? true;
+  if (typeof includeBookDetails !== "boolean") {
+    errors.push("include_book_details must be a boolean.");
+  }
+
+  const enrichTopN = body?.enrich_top_n ?? 10;
+  if (!Number.isInteger(enrichTopN) || enrichTopN < 0 || enrichTopN > 50) {
+    errors.push("enrich_top_n must be an integer between 0 and 50.");
+  }
+
+  return {
+    isValid: errors.length === 0,
+    errors,
+    value: {
+      query,
+      page,
+      per_page: perPage,
+      include_google_enrichment: includeGoogleEnrichment,
+      include_book_details: includeBookDetails,
+      enrich_top_n: enrichTopN,
+    },
+  };
+}
+
 module.exports = {
   validateGenerationRequest,
   validateBookSummaryRequest,
+  validateBookSearchRequest,
 };
